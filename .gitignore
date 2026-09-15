@@ -1,0 +1,5 @@
+node_modules/
+captures/*
+!captures/.gitkeep
+test/sample-report.html
+.DS_Store

@@ -1,0 +1,81 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>JS Recon Tool</title>
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <div id="toolbar">
+    <button id="btn-back" title="Back">&larr;</button>
+    <button id="btn-forward" title="Forward">&rarr;</button>
+    <button id="btn-reload" title="Reload">&#8635;</button>
+    <input id="url-input" type="text" placeholder="Enter target URL and press Enter (e.g. https://example.com)" />
+    <button id="btn-go">Go</button>
+    <button id="btn-start-session">Start Session</button>
+    <span id="session-label">No active session</span>
+  </div>
+
+  <div id="auth-bar">
+    <label>
+      <input type="checkbox" id="auth-checkbox" />
+      I confirm I own this target or have explicit written authorization to test it. Required to enable active/PoC-firing features.
+    </label>
+    <span id="auth-target"></span>
+  </div>
+
+  <div id="tabs">
+    <button class="tab-btn active" data-tab="browser">Browser</button>
+    <button class="tab-btn" data-tab="jsfiles">JS Files (<span id="count-files">0</span>)</button>
+    <button class="tab-btn" data-tab="endpoints">Endpoints (<span id="count-endpoints">0</span>)</button>
+    <button class="tab-btn" data-tab="secrets">Secrets (<span id="count-secrets">0</span>)</button>
+    <button class="tab-btn" data-tab="domxss">DOM XSS (<span id="count-domxss">0</span>)</button>
+    <button class="tab-btn" data-tab="report">Report</button>
+  </div>
+
+  <div id="panels">
+    <div class="panel active" id="panel-browser">
+      <webview id="webview" src="about:blank" partition="persist:reconsession" allowpopups webpreferences="contextIsolation=yes"></webview>
+    </div>
+
+    <div class="panel" id="panel-jsfiles">
+      <div class="split">
+        <div class="list" id="jsfiles-list"></div>
+        <div class="detail" id="jsfiles-detail">Select a captured JS file to view its explanation and source.</div>
+      </div>
+    </div>
+
+    <div class="panel" id="panel-endpoints">
+      <table id="endpoints-table">
+        <thead><tr><th>Context</th><th>Kind</th><th>Host</th><th>Path</th><th>Source</th><th>Line</th></tr></thead>
+        <tbody></tbody>
+      </table>
+    </div>
+
+    <div class="panel" id="panel-secrets">
+      <table id="secrets-table">
+        <thead><tr><th>Type</th><th>Redacted</th><th>Length</th><th>Entropy</th><th>Reason</th><th>Source</th><th>Line</th></tr></thead>
+        <tbody></tbody>
+      </table>
+    </div>
+
+    <div class="panel" id="panel-domxss">
+      <table id="domxss-table">
+        <thead><tr><th>Severity</th><th>Sink</th><th>Target</th><th>Tainted</th><th>Source</th><th>Line</th><th>Snippet</th><th>Actions</th></tr></thead>
+        <tbody></tbody>
+      </table>
+    </div>
+
+    <div class="panel" id="panel-report">
+      <div id="report-controls">
+        <button id="btn-generate-report">Generate Report</button>
+        <button id="btn-export-pdf" disabled>Export PDF</button>
+        <span id="report-status"></span>
+      </div>
+      <iframe id="report-frame"></iframe>
+    </div>
+  </div>
+
+  <script src="renderer.js"></script>
+</body>
+</html>

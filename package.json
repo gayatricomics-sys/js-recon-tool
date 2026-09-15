@@ -1,0 +1,20 @@
+{
+  "name": "js-recon-tool",
+  "version": "0.1.0",
+  "description": "Electron-based JS reconnaissance and DOM XSS static analysis tool for authorized security testing.",
+  "main": "main/main.js",
+  "private": true,
+  "scripts": {
+    "start": "electron .",
+    "postinstall": "node -e \"console.log('js-recon-tool ready. Run: npm start')\""
+  },
+  "author": "",
+  "license": "UNLICENSED",
+  "dependencies": {
+    "acorn": "^8.12.1",
+    "acorn-walk": "^8.3.4"
+  },
+  "devDependencies": {
+    "electron": "^32.0.0"
+  }
+}
