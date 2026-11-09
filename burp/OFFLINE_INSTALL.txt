@@ -1,4 +1,4 @@
-JS Recon - Burp Suite extension (offline package)  v1.4.0
+JS Recon - Burp Suite extension (offline package)  v1.5.0
 =========================================================
 
 Everything needed is in this folder. No internet access is required.
@@ -21,7 +21,7 @@ INSTALL (offline)
    jython-standalone-2.7.4.jar from this folder.
 3. Extensions -> Installed -> Add -> Extension type: Python ->
    select js_recon_burp.py -> Next.
-4. The Output tab should show "[JS Recon] JS Recon 1.4.0 loaded." and the
+4. The Output tab should show "[JS Recon] JS Recon 1.5.0 loaded." and the
    Errors tab should be empty. A new "JS Recon" tab appears.
 
 USE
@@ -44,13 +44,24 @@ USE
   finding with its exact copy-paste payload, the vulnerable line, the likely
   client-controllable source, and concrete steps to reproduce -- ready to
   paste into a finding. Out-of-scope hosts are omitted.
+- Active DOM XSS verification (second toolbar row, in-scope hosts only):
+  * Set "Target page URL" to the page that loads the vulnerable script.
+  * Select a DOM XSS row, then "Fire in browser" builds the test URL
+    (for URL-based sources: hash/query) and, after a confirmation where
+    you can edit the exact URL, opens it in your default browser.
+  * When the alert pops, "Capture screenshot" grabs the screen (or
+    "Attach screenshot file" uses an image you took) and attaches it to
+    the finding. Export PoCs then embeds the popup screenshot and a
+    "How to execute" section in the HTML/Markdown report.
+  NOTE: firing opens the LIVE target in your browser; only in-scope
+  hosts are allowed, and every fire is confirmed first.
 
 SELF-TEST (optional, offline)
 -----------------------------
   sh run_selftest.sh
 Every line should start with [OK]; there should be no [FAIL].
 
-ANALYSIS (v1.4.0)
+ANALYSIS (v1.5.0)
 -----------------
 - JavaScript is beautified first (minified bundles become readable), then
   lexed into tokens. Endpoint / secret / DOM XSS / sensitive-function
