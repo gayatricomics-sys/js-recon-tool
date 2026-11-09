@@ -1,4 +1,4 @@
-JS Recon - Burp Suite extension (offline package)  v1.5.0
+JS Recon - Burp Suite extension (offline package)  v1.6.0
 =========================================================
 
 Everything needed is in this folder. No internet access is required.
@@ -21,7 +21,7 @@ INSTALL (offline)
    jython-standalone-2.7.4.jar from this folder.
 3. Extensions -> Installed -> Add -> Extension type: Python ->
    select js_recon_burp.py -> Next.
-4. The Output tab should show "[JS Recon] JS Recon 1.5.0 loaded." and the
+4. The Output tab should show "[JS Recon] JS Recon 1.6.0 loaded." and the
    Errors tab should be empty. A new "JS Recon" tab appears.
 
 USE
@@ -53,15 +53,24 @@ USE
     "Attach screenshot file" uses an image you took) and attaches it to
     the finding. Export PoCs then embeds the popup screenshot and a
     "How to execute" section in the HTML/Markdown report.
-  NOTE: firing opens the LIVE target in your browser; only in-scope
-  hosts are allowed, and every fire is confirmed first.
+  * Non-URL sources are handled too: postMessage and window.name open an
+    auto-generated trigger harness page; cookie/localStorage/sessionStorage
+    give a console snippet (copied) to paste on the target; referrer and
+    unknown sources show manual steps.
+  * "Fire + capture PoC" fires, waits "Capture delay s" seconds, auto-
+    captures the screen (the alert), attaches it, and saves this finding as
+    a one-off PoC (HTML + Markdown) with the screenshot.
+  * The PoC also shows the "Effective code after injecting the payload".
+  NOTE: firing opens the LIVE target in your DEFAULT browser; the extension
+  API cannot open Burp's embedded browser, but you can paste the URL there.
+  Only in-scope hosts are allowed, and every fire is confirmed first.
 
 SELF-TEST (optional, offline)
 -----------------------------
   sh run_selftest.sh
 Every line should start with [OK]; there should be no [FAIL].
 
-ANALYSIS (v1.5.0)
+ANALYSIS (v1.6.0)
 -----------------
 - JavaScript is beautified first (minified bundles become readable), then
   lexed into tokens. Endpoint / secret / DOM XSS / sensitive-function

