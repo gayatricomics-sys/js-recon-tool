@@ -62,7 +62,7 @@ import re
 import time
 
 
-VERSION = "1.6.0"
+VERSION = "1.6.1"
 AUTHZ_FILENAME = ".js_recon_authorization"
 
 
@@ -2680,9 +2680,8 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener, IContextMenuFactory, IExt
             self._notify("Could not open browser (%s); copied to clipboard instead." % e)
 
     def _schedule_capture(self, item, finding, note):
-        """After a delay (so the alert is on screen), capture the screen and
-        attach it, then offer to export this finding as a PoC. Runs the wait
-        off the EDT."""
+        """After the fire delay, capture the screen (with Burp minimized so the
+        shot shows the browser alert, not the extension) and export the PoC."""
         delay = self._capture_delay()
 
         def worker():
@@ -2690,19 +2689,13 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener, IContextMenuFactory, IExt
                 Thread.sleep(int(delay * 1000))
             except Exception:
                 pass
-            self._on_edt(lambda: self._auto_capture_then_poc(item, finding))
+            self._capture_hidden(
+                finding,
+                then_edt=lambda: self._export_single_poc(item, finding))
 
         t = Thread(_RunnableFn(worker))
         t.setDaemon(True)
         t.start()
-
-    def _auto_capture_then_poc(self, item, finding):
-        ok = self._capture_to(finding)
-        if not ok:
-            self._notify("Auto screenshot failed; click 'Capture screenshot' manually once the alert is visible.")
-            return
-        self._status.setText("Screenshot captured. Exporting this finding as a PoC...")
-        self._export_single_poc(item, finding)
 
     def _clip(self, text):
         try:
@@ -2710,35 +2703,96 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener, IContextMenuFactory, IExt
         except Exception:
             pass
 
-    def _capture_to(self, finding):
-        """Screen-capture to PNG, attach to the finding's marker. Returns bool."""
-        marker = _stable_marker(finding)
+    # -- Screenshot (captures the browser alert, NOT the Burp window) --------
+    def _burp_window(self):
         try:
-            from java.awt import Robot, Rectangle
-            from javax.imageio import ImageIO
-            from java.io import ByteArrayOutputStream
-            from java.util import Base64
-            dim = Toolkit.getDefaultToolkit().getScreenSize()
-            img = Robot().createScreenCapture(Rectangle(0, 0, dim.width, dim.height))
-            baos = ByteArrayOutputStream()
-            ImageIO.write(img, "png", baos)
-            data = baos.toByteArray()
-            self._shots[marker] = {"b64": _u(Base64.getEncoder().encodeToString(data)),
-                                   "bytes": data, "mime": "image/png"}
-            msg = u"Screenshot captured and attached to finding %s (%d bytes)." % (marker, len(data))
-            self._log(msg)
-            self._status.setText(msg)
-            return True
-        except Exception as e:
-            self._log("Screenshot capture failed: %s" % e)
-            return False
+            return SwingUtilities.getWindowAncestor(self._root)
+        except Exception:
+            return None
+
+    def _edt_wait(self, fn):
+        if SwingUtilities.isEventDispatchThread():
+            fn()
+            return
+        try:
+            SwingUtilities.invokeAndWait(_RunnableFn(fn))
+        except Exception:
+            try:
+                fn()
+            except Exception:
+                pass
+
+    def _set_iconified(self, win, on):
+        try:
+            from java.awt import Frame
+            if win is None or not hasattr(win, "setExtendedState"):
+                return
+            st = win.getExtendedState()
+            if on:
+                win.setExtendedState(st | Frame.ICONIFIED)
+            else:
+                win.setExtendedState(st & ~Frame.ICONIFIED)
+                win.toFront()
+                win.requestFocus()
+        except Exception:
+            pass
+
+    def _grab_png(self):
+        from java.awt import Robot, Rectangle
+        from javax.imageio import ImageIO
+        from java.io import ByteArrayOutputStream
+        from java.util import Base64
+        dim = Toolkit.getDefaultToolkit().getScreenSize()
+        img = Robot().createScreenCapture(Rectangle(0, 0, dim.width, dim.height))
+        baos = ByteArrayOutputStream()
+        ImageIO.write(img, "png", baos)
+        data = baos.toByteArray()
+        return data, _u(Base64.getEncoder().encodeToString(data))
+
+    def _capture_hidden(self, finding, then_edt=None, hide=True):
+        """Minimize Burp, grab the screen (now showing the browser + alert),
+        restore Burp, attach the PNG to the finding. Runs off the EDT so the UI
+        never freezes; `then_edt` runs on the EDT after a successful capture."""
+        marker = _stable_marker(finding)
+        win = self._burp_window() if hide else None
+
+        def work():
+            ok = False
+            try:
+                if win is not None:
+                    self._edt_wait(lambda: self._set_iconified(win, True))
+                    Thread.sleep(700)  # let the WM repaint and the alert show
+                data, b64 = self._grab_png()
+                self._shots[marker] = {"b64": b64, "bytes": data, "mime": "image/png"}
+                ok = True
+            except Exception as e:
+                self._log("Screenshot capture failed: %s" % e)
+            finally:
+                if win is not None:
+                    self._edt_wait(lambda: self._set_iconified(win, False))
+
+            def after():
+                if ok:
+                    m = u"Screenshot captured (Burp minimized for the shot) and attached to %s (%d bytes)." % (
+                        marker, len(self._shots[marker]["bytes"]))
+                    self._log(m)
+                    self._status.setText(m)
+                    if then_edt:
+                        then_edt()
+                else:
+                    self._notify("Screenshot capture failed. Use 'Attach screenshot file' instead.")
+            self._on_edt(after)
+
+        t = Thread(_RunnableFn(work))
+        t.setDaemon(True)
+        t.start()
 
     def _on_capture_screenshot(self, evt):
         item, finding = self._selected_xss("Capture screenshot")
         if finding is None:
             return
-        if not self._capture_to(finding):
-            self._notify("Screenshot capture failed. Use 'Attach screenshot file' instead.")
+        self._status.setText("Capturing in ~1s with Burp minimized -- keep the browser alert visible...")
+        self._capture_hidden(finding)
 
     def _export_single_poc(self, item, finding):
         """Write a one-finding PoC report (HTML + MD) with its screenshot."""
