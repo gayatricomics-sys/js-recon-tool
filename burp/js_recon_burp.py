@@ -40,14 +40,18 @@ from java.util import Date
 from java.util.concurrent import ConcurrentHashMap
 from java.util.regex import Pattern, Matcher
 
+import base64
+import cgi
+import codecs
 import json
 import math
+import threading
 import os
 import re
 import time
 
 
-VERSION = "1.0.0"
+VERSION = "1.1.0"
 AUTHZ_FILENAME = ".js_recon_authorization"
 
 
@@ -98,6 +102,7 @@ ASSIGN_VALUE_RE = re.compile(
 
 TAINT_SOURCE_TOKENS = [
     "location.search", "location.hash", "location.href", "location.pathname",
+    "event.data", "evt.data", "msg.data", "message.data",
     "document.referrer", "document.url", "document.documenturi",
     "window.name", "urlsearchparams", "postmessage", "localstorage",
     "sessionstorage", "document.cookie",
@@ -109,6 +114,7 @@ KNOWN_PREFIX_RULES = [
     ("GitHub Token", ("ghp_", "gho_", "ghu_", "ghs_", "ghr_", "github_pat_"), 20, 255),
     ("Slack Token", ("xoxb-", "xoxp-", "xoxa-", "xoxr-", "xoxs-"), 20, 200),
     ("Stripe Key", ("sk_live_", "pk_live_", "rk_live_"), 15, 200),
+    ("Stripe Test Key", ("sk_test_", "rk_test_"), 15, 200),
     ("Anthropic API Key", ("sk-ant-",), 20, 200),
     ("OpenAI API Key", ("sk-",), 20, 200),
 ]
@@ -139,6 +145,14 @@ def entropy(value):
     return result
 
 
+# Relative "a/b" strings that are almost never endpoints: MIME types, date
+# formats, fractions/ratios.
+NOISE_SEGMENT_RE = re.compile(
+    r"^(?:(?:application|text|image|audio|video|font|multipart|model|message)/[\w.+\-*]+"
+    r"|[dmyhsDMYHS]{1,4}/[dmyhsDMYHS]{1,4}(?:/[dmyhsDMYHS]{1,4})?"
+    r"|\d+/\d+)$")
+
+
 def classify_candidate(candidate):
     candidate = candidate.strip()
     if not candidate or len(candidate) > 2000:
@@ -146,7 +160,9 @@ def classify_candidate(candidate):
     if "\n" in candidate or "\t" in candidate or " " in candidate:
         return None
     if "://" in candidate:
-        m = re.match(r"^([a-zA-Z][a-zA-Z0-9+.-]*):/{2}([^/?#]+)([^?#]*)?(\?[^#]*)?(#.*)?$", candidate)
+        # NOTE: Jython/Python 2.7 sre rejects "([^?#]*)?" ("nothing to repeat"),
+        # which previously crashed analysis of every file containing a full URL.
+        m = re.match(r"^([a-zA-Z][a-zA-Z0-9+.-]*):/{2}([^/?#]+)([^?#]*)(\?[^#]*)?(#.*)?$", candidate)
         if m:
             return {"kind": "absolute", "protocol": m.group(1), "host": m.group(2),
                     "pathname": m.group(3) or "", "query": m.group(4) or "", "full": candidate}
@@ -155,6 +171,8 @@ def classify_candidate(candidate):
         return {"kind": "relative-path", "protocol": None, "host": None,
                 "pathname": candidate.split("?")[0], "query": "", "full": candidate}
     parts = candidate.split("/")
+    if NOISE_SEGMENT_RE.match(candidate):
+        return None
     if len(parts) >= 2 and not candidate.startswith((".", "#", "\\")):
         return {"kind": "relative-segment", "protocol": None, "host": None,
                 "pathname": candidate, "query": "", "full": candidate}
@@ -243,7 +261,17 @@ def detect_jwt(value):
         return None
     if any(len(p) < 4 or not base64_like(p) for p in parts):
         return None
-    return "JWT"
+    # Require a real JWT header ({"alg":..} / {"typ":..}) so dotted
+    # hostnames and property chains are not reported as tokens.
+    try:
+        head = str(parts[0]).replace("-", "+").replace("_", "/")
+        head += "=" * (-len(head) % 4)
+        header = json.loads(base64.b64decode(head))
+        if isinstance(header, dict) and ("alg" in header or "typ" in header):
+            return "JWT"
+    except Exception:
+        return None
+    return None
 
 
 def detect_pem(value):
@@ -280,7 +308,16 @@ def scan_secrets(source):
             pattern = re.escape(prefix) + r"[A-Za-z0-9_\-]{%d,%d}" % (tail_min, tail_max)
             for m in re.finditer(pattern, source):
                 value = m.group(0)
-                if label == "OpenAI API Key" and value.startswith("sk-ant-"):
+                if label == "OpenAI API Key":
+                    if value.startswith("sk-ant-"):
+                        continue
+                    # "sk-" alone matches CSS classes (sk-skeleton-...); real
+                    # keys are long, contain digits and mixed case.
+                    if not (re.search(r"\d", value) and re.search(r"[A-Z]", value)
+                            and re.search(r"[a-z]", value) and entropy(value) >= 3.8):
+                        continue
+                # Keys embedded mid-word (e.g. "EURASIA...") are not keys.
+                if m.start() > 0 and re.match(r"[A-Za-z0-9_]", source[m.start() - 1]):
                     continue
                 record(label, value, line_number_of_index(source, m.start()), "known-prefix")
 
@@ -320,130 +357,186 @@ def contains_taint(fragment):
     return any(token in lowered for token in TAINT_SOURCE_TOKENS)
 
 
+def _var_ref_re(name):
+    # \b does not work for identifiers containing "$" (e.g. $el), so use
+    # explicit identifier-boundary lookarounds.
+    return re.compile(r"(?<![\w$.])" + re.escape(name) + r"(?![\w$])")
+
+
+def _statement_window(source, start, limit=400, stop_at_close=False):
+    """Text from `start` to the end of the current expression/statement:
+    stops at ; , or newline at nesting depth 0 (or at the closing paren of a
+    call when stop_at_close). Keeps minified one-line bundles from treating
+    the rest of the whole file as the sink argument."""
+    depth = 0
+    end = start
+    n = min(len(source), start + limit)
+    quote = None
+    while end < n:
+        ch = source[end]
+        if quote:
+            if ch == "\\":
+                end += 2
+                continue
+            if ch == quote:
+                quote = None
+        elif ch in "'\"`":
+            quote = ch
+        elif ch in "([{":
+            depth += 1
+        elif ch in ")]}":
+            if depth == 0:
+                break
+            depth -= 1
+        elif depth == 0 and ch in ";,\n":
+            break
+        end += 1
+    return source[start:end]
+
+
+def _is_commented(source, index):
+    line_start = source.rfind("\n", 0, index) + 1
+    prefix = source[line_start:index].lstrip()
+    return prefix.startswith("//") or prefix.startswith("*") or prefix.startswith("/*")
+
+
+XSS_PROPERTY_SINK_RE = re.compile(
+    r"(?:\.\s*(innerHTML|outerHTML|srcdoc)|\[\s*['\"](innerHTML|outerHTML|srcdoc)['\"]\s*\])\s*=(?![=>])")
+XSS_LOCATION_ASSIGN_RE = re.compile(
+    r"(?<![\w$.])(?:(?:window|document|self|top|parent)\s*\.\s*)?location(?:\s*\.\s*href)?\s*=(?![=>])")
+XSS_CALL_SINKS = [
+    (re.compile(r"\.\s*insertAdjacentHTML\s*\("), "insertAdjacentHTML", False),
+    (re.compile(r"\bdocument\s*\.\s*write\s*\("), "write", False),
+    (re.compile(r"\bdocument\s*\.\s*writeln\s*\("), "writeln", False),
+    (re.compile(r"(?<![\w$.])eval\s*\("), "eval", False),
+    (re.compile(r"\bnew\s+Function\s*\("), "Function-constructor", False),
+    (re.compile(r"(?<![\w$.])(?<!new )(?<!new\t)Function\s*\("), "Function-constructor", False),
+    (re.compile(r"\blocation\s*\.\s*assign\s*\("), "location.assign", False),
+    (re.compile(r"\blocation\s*\.\s*replace\s*\("), "location.replace", False),
+    # jQuery HTML sinks are extremely common with static strings; only report
+    # them when the argument looks attacker-controlled.
+    (re.compile(r"\.\s*(?:html|append|prepend|after|before|replaceWith|wrap|wrapAll)\s*\("), "jquery-html", True),
+    (re.compile(r"(?<![\w$.])(?:\$|jQuery)\s*\("), "jquery-selector", True),
+]
+XSS_TIMER_RE = re.compile(r"\b(setTimeout|setInterval)\s*\(")
+XSS_MESSAGE_LISTENER_RE = re.compile(r"""addEventListener\s*\(\s*['"]message['"]|\bonmessage\s*=(?!=)""")
+TAINT_ASSIGN_RE = re.compile(r"(?<![\w$.])([A-Za-z_$][\w$]*)\s*=(?![=>])\s*([^;\n]{1,600})")
+
+
 def analyze_dom_xss(source):
     findings = []
-    lines = source.split("\n")
-    tainted_vars = set()
 
     # Collect tainted variable names, bounded fixed point.
     assignments = []
-    for m in re.finditer(r"(?:\bvar\b|\blet\b|\bconst\b)?\s*([A-Za-z_$][\w$]*)\s*=\s*([^;\n]{1,600})", source):
+    for m in TAINT_ASSIGN_RE.finditer(source):
         name = m.group(1)
-        value = m.group(2)
+        value = _statement_window(source, m.start(2), 600)
         if re.match(r"^(?:function|class|new\s+Function\b)", value):
             continue
         assignments.append((name, value))
 
+    tainted_vars = set()
+    var_res = {}
     for _ in range(6):
         changed = False
         for name, value in assignments:
             if name in tainted_vars:
                 continue
-            if contains_taint(value):
+            if contains_taint(value) or any(var_res[v].search(value) for v in tainted_vars):
                 tainted_vars.add(name)
+                var_res[name] = _var_ref_re(name)
                 changed = True
-            else:
-                for other in tainted_vars:
-                    if re.search(r"\b" + re.escape(other) + r"\b", value):
-                        tainted_vars.add(name)
-                        changed = True
-                        break
         if not changed:
             break
 
-    for line_no, line in enumerate(lines, 1):
-        stripped = line.strip()
-        if not stripped or stripped.startswith("//") or stripped.startswith("*"):
+    def is_tainted(text):
+        return contains_taint(text) or any(var_res[v].search(text) for v in tainted_vars)
+
+    def add(sink, target, index, argtext, tainted, severity=None):
+        if severity is None:
+            if tainted:
+                severity = "HIGH"
+            elif sink in ("eval", "Function-constructor"):
+                severity = "MEDIUM"
+            else:
+                severity = "LOW"
+        line_no = line_number_of_index(source, index)
+        snippet = source[max(0, index - 60):index + 240].replace("\n", " ").strip()
+        findings.append({
+            "sinkType": sink,
+            "target": target,
+            "line": line_no,
+            "index": index,
+            "snippet": snippet[:300],
+            "argument": argtext[:300],
+            "taintedBySource": bool(tainted),
+            "severity": severity,
+        })
+
+    for m in XSS_PROPERTY_SINK_RE.finditer(source):
+        if _is_commented(source, m.start()):
             continue
+        prop = m.group(1) or m.group(2)
+        right = _statement_window(source, m.end())
+        add(prop, prop, m.start(), right, is_tainted(right))
 
-        # property sinks: innerHTML / outerHTML
-        for m in re.finditer(r"\.(innerHTML|outerHTML)\s*=", line):
-            prop = m.group(1)
-            right = line[m.end():]
-            tainted = contains_taint(right) or any(
-                re.search(r"\b" + re.escape(v) + r"\b", right) for v in tainted_vars
-            )
-            findings.append({
-                "sinkType": prop,
-                "target": line.strip()[:120],
-                "line": line_no,
-                "snippet": stripped[:300],
-                "taintedBySource": tainted,
-                "severity": "HIGH" if tainted else "LOW",
-            })
+    for m in XSS_LOCATION_ASSIGN_RE.finditer(source):
+        if _is_commented(source, m.start()):
+            continue
+        right = _statement_window(source, m.end())
+        tainted = is_tainted(right)
+        add("location-assign", "location", m.start(), right, tainted,
+            "HIGH" if tainted else "INFO")
 
-        # call sinks
-        for prop, label in [("insertAdjacentHTML", "insertAdjacentHTML"), ("document.write", "write"),
-                            ("document.writeln", "writeln"), ("eval", "eval")]:
-            for m in re.finditer(re.escape(prop) + r"\s*\(", line):
-                idx = m.end()
-                depth = 1
-                end = idx
-                while end < len(line) and depth > 0:
-                    ch = line[end]
-                    if ch == "(":
-                        depth += 1
-                    elif ch == ")":
-                        depth -= 1
-                    end += 1
-                argtext = line[idx:end - 1] if depth == 0 else line[idx:min(end, idx + 400)]
-                tainted = contains_taint(argtext) or any(
-                    re.search(r"\b" + re.escape(v) + r"\b", argtext) for v in tainted_vars
-                )
-                severity = "HIGH" if tainted else ("MEDIUM" if label == "eval" else "LOW")
-                findings.append({
-                    "sinkType": label,
-                    "target": prop,
-                    "line": line_no,
-                    "snippet": stripped[:300],
-                    "taintedBySource": tainted,
-                    "severity": severity,
-                })
+    for regex, sink, only_if_tainted in XSS_CALL_SINKS:
+        for m in regex.finditer(source):
+            if _is_commented(source, m.start()):
+                continue
+            arg = _statement_window(source, m.end(), 400, stop_at_close=True)
+            tainted = is_tainted(arg)
+            if only_if_tainted and not tainted:
+                continue
+            add(sink, sink, m.start(), arg, tainted)
 
-        # new Function(...) and setTimeout/setInterval string args
-        for m in re.finditer(r"\bnew\s+Function\s*\(", line):
-            argtext = line[m.end():min(len(line), m.end() + 300)]
-            tainted = contains_taint(argtext) or any(
-                re.search(r"\b" + re.escape(v) + r"\b", argtext) for v in tainted_vars
-            )
-            findings.append({
-                "sinkType": "Function-constructor",
-                "target": "new Function()",
-                "line": line_no,
-                "snippet": stripped[:300],
-                "taintedBySource": tainted,
-                "severity": "HIGH" if tainted else "MEDIUM",
-            })
+    for m in XSS_TIMER_RE.finditer(source):
+        if _is_commented(source, m.start()):
+            continue
+        # The window stops at the first depth-0 comma, i.e. it is the first
+        # argument only.
+        first = _statement_window(source, m.end(), 400).strip()
+        sink = m.group(1) + "-string-arg"
+        if first[:1] in ("'", '"', "`"):
+            add(sink, m.group(1), m.start(), first, is_tainted(first), "MEDIUM")
+        elif not re.match(r"(?:async\s+)?(?:function\b|\(?[\w$,\s]*\)?\s*=>)", first) and is_tainted(first):
+            add(sink, m.group(1), m.start(), first, True, "HIGH")
 
-        for m in re.finditer(r"\b(setTimeout|setInterval)\s*\(\s*['\"]", line):
-            findings.append({
-                "sinkType": m.group(1) + "-string-arg",
-                "target": m.group(1),
-                "line": line_no,
-                "snippet": stripped[:300],
-                "taintedBySource": contains_taint(line),
-                "severity": "MEDIUM",
-            })
+    for m in XSS_MESSAGE_LISTENER_RE.finditer(source):
+        if _is_commented(source, m.start()):
+            continue
+        body = source[m.start():m.start() + 1500]
+        has_origin_check = re.search(r"\.origin\b", body) is not None
+        # Find the handler's event parameter (function(ev){..} / ev => ..) and
+        # check whether ev.data reaches an HTML/JS sink inside the handler.
+        pm = re.search(r"function\s*[\w$]*\s*\(\s*([\w$]+)|\(?\s*([\w$]+)\s*\)?\s*=>", body)
+        param = (pm.group(1) or pm.group(2)) if pm else None
+        data_to_sink = False
+        if param:
+            data_re = re.escape(param) + r"\s*\.\s*data\b"
+            data_to_sink = re.search(
+                r"(?:innerHTML|outerHTML|srcdoc|insertAdjacentHTML|document\.write|eval|Function|\.html|location)"
+                r"[^;]{0,200}" + data_re, body) is not None
+        if data_to_sink:
+            severity = "MEDIUM" if has_origin_check else "HIGH"
+        else:
+            severity = "LOW" if has_origin_check else "MEDIUM"
+        add("message-listener", "postMessage handler", m.start(), body[:300], data_to_sink, severity)
 
-        for m in re.finditer(r"\blocation\s*\.\s*(assign|replace)\s*\(", line):
-            argtext = line[m.end():min(len(line), m.end() + 300)]
-            tainted = contains_taint(argtext) or any(
-                re.search(r"\b" + re.escape(v) + r"\b", argtext) for v in tainted_vars
-            )
-            findings.append({
-                "sinkType": "location." + m.group(1),
-                "target": "location",
-                "line": line_no,
-                "snippet": stripped[:300],
-                "taintedBySource": tainted,
-                "severity": "HIGH" if tainted else "LOW",
-            })
-
-    # deduplicate by (sink, line, snippet)
+    # Deduplicate by (sink, position) -- NOT by line, so every sink in a
+    # minified single-line bundle is reported.
     deduped = []
     seen = set()
-    for f in findings:
-        key = (f["sinkType"], f["line"], f["snippet"])
+    for f in sorted(findings, key=lambda x: x["index"]):
+        key = (f["sinkType"], f["index"])
         if key not in seen:
             seen.add(key)
             deduped.append(f)
@@ -495,6 +588,9 @@ def analyze_js_source(source, meta):
         "frameworks": frameworks,
         "summary": summary,
         "lineCount": lines_of(source),
+        # The Files table and detail pane read item["lines"]; it was missing,
+        # which raised KeyError on every repaint of the JS Files tab.
+        "lines": lines_of(source),
     }
 
 
@@ -517,6 +613,11 @@ def payload_for_finding(finding):
         "setInterval-string-arg": "alert('%s')" % marker,
         "location.assign": "javascript:alert('%s')" % marker,
         "location.replace": "javascript:alert('%s')" % marker,
+        "location-assign": "javascript:alert('%s')" % marker,
+        "srcdoc": '<script>console.warn(\'%s\');alert(\'%s\')<\/script>' % (marker, marker),
+        "jquery-html": '<img src=x onerror="console.warn(\'%s\');alert(\'%s\')">' % (marker, marker),
+        "jquery-selector": '<img src=x onerror="console.warn(\'%s\');alert(\'%s\')">' % (marker, marker),
+        "message-listener": "postMessage('<img src=x onerror=alert(\\'%s\\')>', '*')  // send from an attacker-controlled window/iframe" % marker,
     }
     payload = templates.get(sink, '<img src=x onerror="alert(\'%s\')">' % marker)
     return marker, payload
@@ -525,6 +626,43 @@ def payload_for_finding(finding):
 # ---------------------------------------------------------------------------
 # Table models
 # ---------------------------------------------------------------------------
+
+MAX_SOURCE_CHARS = 8 * 1024 * 1024
+
+
+class _RunnableFn(Runnable):
+    def __init__(self, fn):
+        self._fn = fn
+
+    def run(self):
+        try:
+            self._fn()
+        except Exception:
+            pass
+
+
+def _u(value):
+    """Unicode-safe text conversion (Jython str() fails on non-ASCII)."""
+    if value is None:
+        return u""
+    if isinstance(value, unicode):
+        return value
+    try:
+        return unicode(value)
+    except UnicodeDecodeError:
+        return str(value).decode("utf-8", "replace")
+
+
+def _esc(value):
+    return cgi.escape(_u(value), quote=True)
+
+
+def _csv_cell(value):
+    text = _u(value).replace("\r", " ").replace("\n", " ")
+    if any(c in text for c in ',"'):
+        text = u'"' + text.replace(u'"', u'""') + u'"'
+    return text
+
 
 class FilesTableModel(AbstractTableModel):
     columns = ["#", "URL", "Lines", "Endpoints", "Secrets", "DOM XSS", "Frameworks"]
@@ -595,7 +733,7 @@ class SimpleTableModel(AbstractTableModel):
         value = item.get(self.columns[col], "")
         if isinstance(value, (int, float, long, bool)):
             return value
-        return JString(str(value))
+        return JString(_u(value))
 
     def getColumnClass(self, c):
         return JString
@@ -628,7 +766,7 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener, IContextMenuFactory, IExt
 
         self._store = {}  # id -> item
         self._next_id = 1
-        self._lock = Thread.currentThread()
+        self._lock = threading.RLock()
         self._host_cache = set()
         self._authz_host = None
         self._authz_checked = False
@@ -667,11 +805,14 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener, IContextMenuFactory, IExt
         response = message.getResponse()
         if not response:
             return
-        info = self._helpers.analyzeRequest(message)
+        # Content-Type must come from the RESPONSE headers (the old code read
+        # the request headers, so JS was only detected by URL extension).
+        info = self._helpers.analyzeResponse(response)
         headers = info.getHeaders()
-        content_type = self._helpers.getHeaderValue(headers, "Content-Type") or ""
-        url = str(message.getUrl())
-        if "javascript" not in content_type.lower() and not self._looks_like_js_url(url):
+        content_type = (self._helpers.getHeaderValue(headers, "Content-Type") or "").lower()
+        url = unicode(message.getUrl())
+        is_js_type = any(t in content_type for t in ("javascript", "ecmascript", "jscript"))
+        if not is_js_type and not self._looks_like_js_url(message.getUrl()):
             return
         if self._scope_only.isSelected() and not self._callbacks.isInScope(message.getUrl()):
             return
@@ -682,8 +823,11 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener, IContextMenuFactory, IExt
                 return
         self._analyze_and_store(message, url)
 
-    def _looks_like_js_url(self, url):
-        return ".js" in url.lower() or ".mjs" in url.lower()
+    def _looks_like_js_url(self, java_url):
+        # Match on the path extension only, so .json / .jsp / ?x=.js are not
+        # mistaken for JavaScript.
+        path = unicode(java_url.getPath() or "").lower()
+        return path.endswith(".js") or path.endswith(".mjs") or path.endswith(".cjs")
 
     # -- Context menu --------------------------------------------------------
     def createMenuItems(self, invocation):
@@ -704,39 +848,54 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener, IContextMenuFactory, IExt
     # -- Analysis ------------------------------------------------------------
     def _analyze_and_store(self, message, url):
         response = message.getResponse()
-        bytes_data = response
-        source = None
         try:
-            source = self._helpers.bytesToString(bytes_data)
-        except:
-            source = ""
-        if source is None or not source.strip():
+            # Analyze only the body, not the HTTP status line + headers.
+            body_offset = self._helpers.analyzeResponse(response).getBodyOffset()
+            source = unicode(self._helpers.bytesToString(response)[body_offset:])
+        except Exception:
+            source = u""
+        if not source.strip():
+            return
+        if len(source) > MAX_SOURCE_CHARS:
+            self._log("Skipped %s: %d chars exceeds %d limit." % (url, len(source), MAX_SOURCE_CHARS))
             return
 
-        # Avoid reanalyzing identical large source blobs.
-        existing = self._by_url.get(url)
-        if existing is not None and existing.get("sourceHash") == hash(source):
-            return
+        source_hash = hash(source)
+        with self._lock:
+            existing = self._by_url.get(url)
+            if existing is not None and existing.get("sourceHash") == source_hash:
+                return
 
+        # Heavy analysis runs outside the lock (Burp calls us from many threads).
         item = {
-            "id": self._next_id,
             "url": url,
-            "host": str(message.getUrl().getHost()),
+            "host": unicode(message.getUrl().getHost()),
             "method": self._helpers.analyzeRequest(message).getMethod() if message.getRequest() else "",
             "ts": int(time.time() * 1000),
             "source": source,
-            "sourceHash": hash(source),
+            "sourceHash": source_hash,
         }
-        result = analyze_js_source(source, item)
-        item.update(result)
+        item.update(analyze_js_source(source, item))
 
-        self._next_id += 1
-        self._store[item["id"]] = item
-        self._by_url[url] = item
+        with self._lock:
+            existing = self._by_url.get(url)
+            if existing is not None and existing.get("sourceHash") == source_hash:
+                return
+            item["id"] = self._next_id
+            self._next_id += 1
+            self._store[item["id"]] = item
+            self._by_url[url] = item
+
         self._log("Analyzed %s (E:%d S:%d X:%d)" % (
             url, len(item["endpoints"]), len(item["secrets"]), len(item["xss"])))
-        self._refresh_tables()
-        self._update_stats()
+        # Swing models must only be touched on the Event Dispatch Thread.
+        self._on_edt(lambda: (self._append_item_rows(item), self._update_stats()))
+
+    def _on_edt(self, fn):
+        if SwingUtilities.isEventDispatchThread():
+            fn()
+        else:
+            SwingUtilities.invokeLater(_RunnableFn(fn))
 
     # -- UI ------------------------------------------------------------------
     def _build_ui(self):
@@ -774,6 +933,8 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener, IContextMenuFactory, IExt
         self._auto_capture = JCheckBox("Passive capture", True)
         self._scope_only = JCheckBox("In-scope only", False)
         self._host_filter = JTextField(14)
+        # Press Enter in the host filter to re-apply it to existing findings.
+        self._host_filter.addActionListener(lambda evt: self._refresh_tables())
         search_btn = JButton("Search", actionPerformed=self._on_search)
         self._search_field = JTextField(18)
         search_btn2 = JButton("Find", actionPerformed=self._on_search)
@@ -911,6 +1072,8 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener, IContextMenuFactory, IExt
         return "\n".join(lines)
 
     def _refresh_tables(self):
+        """Full rebuild (used after Clear). New captures use _append_item_rows
+        so the UI does not re-render every row on each response."""
         self._files_model.clearRows()
         self._endpoint_model.clearRows()
         self._secret_model.clearRows()
@@ -919,69 +1082,69 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener, IContextMenuFactory, IExt
         self._secret_by_row = []
         self._xss_by_row = []
         self._xss_findings = []
-
-        for item in sorted(self._store.values(), key=lambda i: i["id"]):
-            self._files_model.addRow(item)
-            host_filter = str(self._host_filter.getText()).strip().lower()
-            if host_filter and host_filter not in item["host"].lower():
-                continue
-            for e in item["endpoints"]:
-                self._endpoint_by_row.append(item)
-                self._endpoint_model.addRow({
-                    "URL": e["raw"],
-                    "Kind": e["kind"],
-                    "Host": e["host"],
-                    "Path": e["path"],
-                    "Query": e["query"],
-                    "Line": e["line"],
-                    "Source File": item["url"],
-                })
-            for s in item["secrets"]:
-                self._secret_by_row.append(item)
-                self._secret_model.addRow({
-                    "Type": s["type"],
-                    "Redacted": s["redacted"],
-                    "Length": s["length"],
-                    "Entropy": s["entropy"],
-                    "Line": s["line"],
-                    "Reason": s["reason"],
-                    "Source File": item["url"],
-                })
-            for x in item["xss"]:
-                self._xss_by_row.append(item)
-                self._xss_findings.append(x)
-                self._xss_model.addRow({
-                    "Severity": x["severity"],
-                    "Sink": x["sinkType"],
-                    "Target": x["target"],
-                    "Line": x["line"],
-                    "Tainted": "yes" if x["taintedBySource"] else "no",
-                    "Snippet": x["snippet"],
-                    "Source File": item["url"],
-                })
+        with self._lock:
+            items = sorted(self._store.values(), key=lambda i: i["id"])
+        for item in items:
+            self._append_item_rows(item)
         self._update_stats()
 
+    def _append_item_rows(self, item):
+        self._files_model.addRow(item)
+        host_filter = _u(self._host_filter.getText()).strip().lower()
+        if host_filter and host_filter not in item["host"].lower():
+            return
+        for e in item["endpoints"]:
+            self._endpoint_by_row.append(item)
+            self._endpoint_model.addRow({
+                "URL": e["raw"],
+                "Kind": e["kind"],
+                "Host": e["host"],
+                "Path": e["path"],
+                "Query": e["query"],
+                "Line": e["line"],
+                "Source File": item["url"],
+            })
+        for s in item["secrets"]:
+            self._secret_by_row.append(item)
+            self._secret_model.addRow({
+                "Type": s["type"],
+                "Redacted": s["redacted"],
+                "Length": s["length"],
+                "Entropy": s["entropy"],
+                "Line": s["line"],
+                "Reason": s["reason"],
+                "Source File": item["url"],
+            })
+        for x in item["xss"]:
+            self._xss_by_row.append(item)
+            self._xss_findings.append(x)
+            self._xss_model.addRow({
+                "Severity": x["severity"],
+                "Sink": x["sinkType"],
+                "Target": x["target"],
+                "Line": x["line"],
+                "Tainted": "yes" if x["taintedBySource"] else "no",
+                "Snippet": x["snippet"],
+                "Source File": item["url"],
+            })
+
     def _update_stats(self):
-        files = len(self._store)
-        endpoints = sum(len(i["endpoints"]) for i in self._store.values())
-        secrets = sum(len(i["secrets"]) for i in self._store.values())
-        xss = sum(len(i["xss"]) for i in self._store.values())
+        with self._lock:
+            items = list(self._store.values())
+        files = len(items)
+        endpoints = sum(len(i["endpoints"]) for i in items)
+        secrets = sum(len(i["secrets"]) for i in items)
+        xss = sum(len(i["xss"]) for i in items)
         self._status.setText("Files: %d | Endpoints: %d | Secrets: %d | DOM XSS: %d" % (
             files, endpoints, secrets, xss))
 
     # -- Actions -------------------------------------------------------------
     def _on_clear(self, evt):
-        self._store.clear()
-        self._by_url.clear()
-        self._files_model.clearRows()
-        self._endpoint_model.clearRows()
-        self._secret_model.clearRows()
-        self._xss_model.clearRows()
-        self._endpoint_by_row = []
-        self._secret_by_row = []
-        self._xss_by_row = []
+        with self._lock:
+            self._store.clear()
+            self._by_url.clear()
+        self._refresh_tables()
         self._log("Cleared all captured JS files and findings.")
-        self._update_stats()
 
     def _on_search(self, evt):
         term = str(self._search_field.getText()).strip().lower()
@@ -989,7 +1152,7 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener, IContextMenuFactory, IExt
             self._log("Search: enter a term.")
             return
         matched_files = []
-        for item in self._store.values():
+        for item in self._snapshot():
             hay = " ".join([
                 item["url"],
                 item["summary"],
@@ -1017,18 +1180,7 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener, IContextMenuFactory, IExt
             self._log("Export dialog error: %s" % e)
             return
         try:
-            with open(str(target.getAbsolutePath()), "w") as f:
-                f.write("kind,url,field,value,extra\n")
-                for item in self._store.values():
-                    base = "%s" % item["url"]
-                    for e in item["endpoints"]:
-                        f.write("endpoint,%s,%s,%s,%s\n" % (base, e["kind"], e["raw"], e["line"]))
-                    for s in item["secrets"]:
-                        f.write("secret,%s,%s,%s,%s,%s\n" % (base, s["type"], s["redacted"], s["entropy"], s["line"]))
-                    for x in item["xss"]:
-                        f.write("domxss,%s,%s,%s,%s,%s,%s\n" % (
-                            base, x["sinkType"], x["severity"], x["line"],
-                            "tainted" if x["taintedBySource"] else "not-tainted", x["snippet"].replace("\n", " ")))
+            self._write_csv(_u(target.getAbsolutePath()))
             self._log("Exported CSV to %s" % target.getAbsolutePath())
             self._status.setText("CSV exported to %s" % target.getAbsolutePath())
         except Exception as e:
@@ -1052,33 +1204,55 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener, IContextMenuFactory, IExt
         except Exception as e:
             self._log("HTML export error: %s" % e)
 
-    def _write_html_report(self, path):
-        rows = []
-        for item in sorted(self._store.values(), key=lambda i: i["id"]):
-            rows.append("<h3>%s</h3>" % item["url"])
-            rows.append("<p><b>Summary:</b> %s</p>" % item["summary"])
-            if item["endpoints"]:
-                rows.append("<p><b>Endpoints</b></p><ul>")
+    def _snapshot(self):
+        with self._lock:
+            return sorted(self._store.values(), key=lambda i: i["id"])
+
+    def _write_csv(self, path):
+        with codecs.open(path, "w", "utf-8") as f:
+            f.write(u"﻿kind,source_file,line,type,value,severity,detail\r\n")
+            for item in self._snapshot():
                 for e in item["endpoints"]:
-                    rows.append("<li>L%d <code>%s</code> <i>(%s)</i></li>" % (e["line"], e["raw"], e["kind"]))
-                rows.append("</ul>")
-            if item["secrets"]:
-                rows.append("<p><b>Secrets</b></p><ul>")
+                    row = ["endpoint", item["url"], e["line"], e["kind"], e["raw"], "", e["host"]]
+                    f.write(u",".join(_csv_cell(c) for c in row) + u"\r\n")
                 for s in item["secrets"]:
-                    rows.append("<li>L%d <code>%s</code> <i>(%s)</i></li>" % (s["line"], s["redacted"], s["type"]))
-                rows.append("</ul>")
-            if item["xss"]:
-                rows.append("<p><b>DOM XSS</b></p><ul>")
+                    row = ["secret", item["url"], s["line"], s["type"], s["redacted"], "",
+                           "entropy=%s %s" % (s["entropy"], s["reason"])]
+                    f.write(u",".join(_csv_cell(c) for c in row) + u"\r\n")
                 for x in item["xss"]:
-                    rows.append("<li>L%d <b>%s</b> <code>%s</code> <i>%s</i></li>" % (
-                        x["line"], x["severity"], x["sinkType"],
-                        "tainted" if x["taintedBySource"] else "not tainted"))
-                rows.append("</ul>")
-        html = "<html><head><meta charset='utf-8'><title>JS Recon Report</title></head><body>"
-        html += "<h1>JS Recon Report</h1><p>Generated by JS Recon Burp extension.</p>"
-        html += "".join(rows)
-        html += "</body></html>"
-        with open(path, "w") as f:
+                    row = ["domxss", item["url"], x["line"], x["sinkType"], x["snippet"], x["severity"],
+                           "tainted" if x["taintedBySource"] else "not-tainted"]
+                    f.write(u",".join(_csv_cell(c) for c in row) + u"\r\n")
+
+    def _write_html_report(self, path):
+        # Every value comes from the target's JavaScript, so it is HTML-escaped
+        # (otherwise a hostile JS file could inject script into the report).
+        rows = []
+        for item in self._snapshot():
+            rows.append(u"<h3>%s</h3>" % _esc(item["url"]))
+            rows.append(u"<p><b>Summary:</b> %s</p>" % _esc(item["summary"]))
+            if item["endpoints"]:
+                rows.append(u"<p><b>Endpoints</b></p><ul>")
+                for e in item["endpoints"]:
+                    rows.append(u"<li>L%d <code>%s</code> <i>(%s)</i></li>" % (e["line"], _esc(e["raw"]), _esc(e["kind"])))
+                rows.append(u"</ul>")
+            if item["secrets"]:
+                rows.append(u"<p><b>Secrets</b></p><ul>")
+                for s in item["secrets"]:
+                    rows.append(u"<li>L%d <code>%s</code> <i>(%s)</i></li>" % (s["line"], _esc(s["redacted"]), _esc(s["type"])))
+                rows.append(u"</ul>")
+            if item["xss"]:
+                rows.append(u"<p><b>DOM XSS</b></p><ul>")
+                for x in item["xss"]:
+                    rows.append(u"<li>L%d <b>%s</b> <code>%s</code> <i>%s</i><pre>%s</pre></li>" % (
+                        x["line"], _esc(x["severity"]), _esc(x["sinkType"]),
+                        "tainted" if x["taintedBySource"] else "not tainted", _esc(x["snippet"])))
+                rows.append(u"</ul>")
+        html = u"<html><head><meta charset='utf-8'><title>JS Recon Report</title></head><body>"
+        html += u"<h1>JS Recon Report</h1><p>Generated by JS Recon Burp extension.</p>"
+        html += u"".join(rows)
+        html += u"</body></html>"
+        with codecs.open(path, "w", "utf-8") as f:
             f.write(html)
 
     def _selected_item(self):
@@ -1089,10 +1263,6 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener, IContextMenuFactory, IExt
         return self._files_model.rows.get(model_row)
 
     def _on_copy_poc(self, evt):
-        item = self._selected_item()
-        if not item or not item["xss"]:
-            self._log("Copy PoC: select a JS file with DOM XSS findings.")
-            return
         row = self._xss_table.getSelectedRow()
         if row < 0:
             self._log("Copy PoC: select a finding in the DOM XSS table.")
@@ -1101,6 +1271,10 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener, IContextMenuFactory, IExt
         if idx >= len(self._xss_findings):
             self._log("Copy PoC: selection is out of range.")
             return
+        # Use the file the finding came from (previously this used whatever
+        # was selected in the JS Files tab, so the authorization host check
+        # could be made against the wrong host).
+        item = self._xss_by_row[idx]
         finding = self._xss_findings[idx]
         self._generate_and_copy(item, finding)
 
@@ -1134,10 +1308,17 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener, IContextMenuFactory, IExt
 
     # -- Logging -------------------------------------------------------------
     def _log(self, message):
+        text = _u(message)
         try:
-            self._callbacks.printOutput("[JS Recon] " + str(message))
-            if hasattr(self, "_log_area") and self._log_area is not None:
-                self._log_area.append("%s\n" % message)
+            self._callbacks.printOutput(u"[JS Recon] " + text)
+        except Exception:
+            pass
+
+        def append():
+            if getattr(self, "_log_area", None) is not None:
+                self._log_area.append(text + u"\n")
                 self._log_area.setCaretPosition(self._log_area.getDocument().getLength())
+        try:
+            self._on_edt(append)
         except Exception:
             pass

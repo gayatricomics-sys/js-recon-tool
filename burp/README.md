@@ -3,10 +3,16 @@
 This is a Burp Suite extension that ports the JS Recon Tool into Burp as a
 passive JavaScript reconnaissance panel.
 
-## Install
+## Install (works fully offline)
 
-1. Open Burp Suite -> `Extender` -> `Options`.
-2. Configure Jython 2.7 if not already configured.
+Everything needed ships in this folder, including the Jython runtime
+(`jython-standalone-2.7.4.jar`, official build, SHA-1
+`df61c8c28ce458bc84d92a12aaaf20b15dbc55db`). No internet is required.
+See [OFFLINE_INSTALL.txt](OFFLINE_INSTALL.txt) for details.
+
+1. Open Burp Suite -> `Settings` -> `Extensions` -> `Python environment`
+   (older Burp: `Extender` -> `Options`).
+2. Set the Jython standalone JAR to `burp/jython-standalone-2.7.4.jar`.
 3. Go to `Extender` -> `Extensions` -> `Add`.
 4. Set `Extension type` to **Python**.
 5. Select `burp/js_recon_burp.py`.
@@ -29,6 +35,15 @@ passive JavaScript reconnaissance panel.
 5. For DOM-XSS findings, select a finding in the DOM XSS table and click
    **Copy PoC** to copy a payload to the clipboard. This requires the
    authorization checkbox to be enabled for the matching host.
+
+## Offline self-test
+
+```bash
+sh burp/run_selftest.sh
+```
+
+Runs the extension in the bundled Jython against a mock Burp API (needs only
+Java). Every line should start with `[OK]`.
 
 ## Notes
 

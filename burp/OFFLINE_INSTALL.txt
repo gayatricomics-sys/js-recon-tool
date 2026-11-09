@@ -1,0 +1,50 @@
+JS Recon - Burp Suite extension (offline package)  v1.1.0
+=========================================================
+
+Everything needed is in this folder. No internet access is required.
+
+  js_recon_burp.py              the Burp extension (Jython / Python 2.7)
+  jython-standalone-2.7.4.jar   Jython runtime Burp needs to run Python extensions
+                                (official build, SHA-1 df61c8c28ce458bc84d92a12aaaf20b15dbc55db)
+  run_selftest.sh               offline self-test (optional)
+  selftest/                     files used by the self-test
+
+The extension uses only the Python 2.7 standard library bundled inside the
+Jython jar plus Java/Swing classes, so there is nothing else to install.
+
+INSTALL (offline)
+-----------------
+1. Copy this whole folder to the offline machine.
+2. Burp Suite -> Settings -> Extensions -> Python environment
+   (older Burp: Extender -> Options -> Python Environment)
+   -> "Location of Jython standalone JAR file" -> select
+   jython-standalone-2.7.4.jar from this folder.
+3. Extensions -> Installed -> Add -> Extension type: Python ->
+   select js_recon_burp.py -> Next.
+4. The Output tab should show "[JS Recon] JS Recon 1.1.0 loaded." and the
+   Errors tab should be empty. A new "JS Recon" tab appears.
+
+USE
+---
+- Browse the authorized target through Burp Proxy. JavaScript responses
+  (by response Content-Type, or .js/.mjs/.cjs path) are analyzed automatically.
+- Right-click any request in Proxy / HTTP history / Repeater -> Send to JS Recon.
+- Host filter: type a host and press Enter to re-filter existing findings.
+- DOM XSS tab: select a row, tick the authorization box for that exact host,
+  then "Copy PoC" copies a marker payload to the clipboard. Nothing is sent
+  automatically; you test it manually.
+- Export CSV / Export HTML write UTF-8 files (HTML output is escaped).
+
+SELF-TEST (optional, offline)
+-----------------------------
+  sh run_selftest.sh
+Every line should start with [OK]; there should be no [FAIL].
+
+LIMITS (static heuristics - always verify manually)
+---------------------------------------------------
+- Regex-based, not a JS parser: taint tracking is best-effort, so expect some
+  false positives and negatives. Findings are leads, not confirmed bugs.
+- Inline <script> blocks inside HTML pages are not analyzed (only JS responses).
+- Secrets are shown redacted; the full value is in the captured source
+  (JS Files tab detail pane) at the listed line.
+- Files larger than 8 MB are skipped (logged in the Log tab).
