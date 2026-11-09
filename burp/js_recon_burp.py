@@ -62,7 +62,7 @@ import re
 import time
 
 
-VERSION = "1.3.0"
+VERSION = "1.3.1"
 AUTHZ_FILENAME = ".js_recon_authorization"
 
 
@@ -1408,6 +1408,11 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener, IContextMenuFactory, IExt
         self._next_id = 1
         self._lock = threading.RLock()
         self._host_cache = set()
+        # Capture diagnostics (surfaced in the Log tab).
+        self._seen_responses = 0
+        self._seen_js = 0
+        self._skip_scope = 0
+        self._skip_filter = 0
 
         self._build_ui()
         callbacks.addSuiteTab(self)
@@ -1443,6 +1448,9 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener, IContextMenuFactory, IExt
         response = message.getResponse()
         if not response:
             return
+        self._seen_responses += 1
+        if self._seen_responses == 1:
+            self._log("Passive capture is receiving traffic (first HTTP response seen).")
         # Content-Type must come from the RESPONSE headers (the old code read
         # the request headers, so JS was only detected by URL extension).
         info = self._helpers.analyzeResponse(response)
@@ -1460,13 +1468,38 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener, IContextMenuFactory, IExt
             except Exception:
                 pass
         if not is_js_type and not self._looks_like_js_url(java_url):
+            self._heartbeat()
             return
+        # This IS a JavaScript response. From here, log why it is or isn't kept
+        # so an empty JS Recon tab is never a silent mystery.
+        self._seen_js += 1
+        if self._seen_js == 1:
+            self._log("First JavaScript response seen: %s" % url)
         if self._scope_only.isSelected() and not self._callbacks.isInScope(java_url):
+            self._skip_scope += 1
+            if self._skip_scope <= 20 or self._skip_scope % 50 == 0:
+                self._log("Skipped (out of Burp scope): %s  -- add its host to Target > Scope, "
+                          "or untick 'In-scope only' to capture all JS." % url)
+            self._heartbeat()
             return
         allowed = _u(self._host_filter.getText()).strip().lower()
         if allowed and allowed not in _u(java_url.getHost()).lower():
+            self._skip_filter += 1
+            if self._skip_filter <= 5:
+                self._log("Skipped (host filter '%s'): %s" % (allowed, url))
+            self._heartbeat()
             return
         self._analyze_and_store(message, url, java_url)
+
+    def _heartbeat(self):
+        # Periodic one-liner so the user can tell traffic is flowing and see
+        # why nothing was captured, without spamming the log.
+        if self._seen_responses % 100 != 0:
+            return
+        self._log("Traffic seen: %d responses, %d JavaScript, %d analyzed, "
+                  "%d skipped out-of-scope, %d skipped by host filter." % (
+                      self._seen_responses, self._seen_js, len(self._store),
+                      self._skip_scope, self._skip_filter))
 
     def _url_of(self, message):
         """java.net.URL for a message. IHttpRequestResponse has no getUrl() in

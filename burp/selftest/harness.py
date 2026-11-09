@@ -120,6 +120,8 @@ step("PoC for every sink type", lambda: len([M.payload_for_finding({"sinkType": 
 step("scope: in-scope host authorized", lambda: ext._is_authorized({"url": u"https://t.test/a.js", "host": u"t.test"}))
 step("scope: out-of-scope host blocked", lambda: (ext._generate_and_copy({"url": u"https://evil.test/a.js", "host": u"evil.test"}, {"sinkType": "eval"}), flush(), ext._status.getText()[:40])[-1])
 step("scope: out-of-scope JS not captured (In-scope only default)", lambda: (ext.processHttpMessage(4, False, Msg("https://other.test/x.js", "eval(location.hash)", "application/javascript")), any(i["host"] == u"other.test" for i in ext._store.values()))[-1])
+step("diag: out-of-scope JS logs a skip reason", lambda: (ext.processHttpMessage(4, False, Msg("https://cdn.evil.test/a.js", "var x=1", "application/javascript")), any("out of Burp scope" in l for l in LOGGED))[-1])
+step("diag: counters increment", lambda: (ext._seen_responses > 0 and ext._seen_js > 0))
 def find(term):
     flush(); ext._search_field.setText(term); ext._on_search(None)
     return (ext._files_table.getRowCount(), ext._endpoint_table.getRowCount(), ext._secret_table.getRowCount(), ext._xss_table.getRowCount(), ext._status.getText()[:30])
