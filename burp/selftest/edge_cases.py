@@ -1,4 +1,5 @@
 import sys; sys.path.insert(0, sys.argv[1]); sys.path.insert(0, sys.argv[2])
+# Fixture key strings are split ("sk_" + "test_" ...) so repo secret scanners do not flag them.
 import js_recon_burp as M
 x=lambda s:["%s:%s"%(f["sinkType"],f["severity"]) for f in M.analyze_dom_xss(unicode(s))]
 sc=lambda s:[f["type"] for f in M.scan_secrets(unicode(s))]
@@ -21,7 +22,7 @@ for n,r in [
  ("a == b not taint assign", x("var h=location.hash; if (z == h) {}; y.innerHTML = z;")),
  ("commented sink -> none", x("// el.innerHTML = location.hash;")),
  ("sk- css class -> none", sc("var c='sk-skeleton-loader-wrapper';")),
- ("stripe test key", sc("var k='" + "sk_" + "test_" + "4eC39HqLyjWDarjtT1zdp7dc" + "';")  # split so repo secret scanners do not flag the fixture),
+ ("stripe test key", sc("var k='" + "sk_" + "test_" + "4eC39HqLyjWDarjtT1zdp7dc" + "';")),
  ("real JWT", sc("var t='eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.dozjgNryP4J3jVmNHl0w5N_XgL0n3I9PlFUP0THsR8U';")),
  ("endpoint noise filtered", e("const a='text/html', b='application/json', c='dd/mm/yyyy', d='/api/v2/orders', f='https://x.test/a?b=1';")),
 ]: print("%-32s %s" % (n, r))
