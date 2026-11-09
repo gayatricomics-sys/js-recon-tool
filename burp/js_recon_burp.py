@@ -32,7 +32,7 @@ This extension is passive and does not attack or modify traffic.
 from burp import IBurpExtender, ITab, IHttpListener, IContextMenuFactory, IExtensionStateListener
 from burp import IParameter
 
-from java.awt import BorderLayout, Dimension, Font, Color, GridBagLayout, GridBagConstraints, Insets, Toolkit
+from java.awt import BorderLayout, Dimension, Font, Color, GridBagLayout, GridBagConstraints, Insets, Toolkit, GridLayout
 from java.awt.datatransfer import StringSelection
 from java.awt.event import ActionListener, KeyListener
 from javax.swing import (JPanel, JLabel, JTextField, JButton, JCheckBox, JComboBox,
@@ -62,7 +62,7 @@ import re
 import time
 
 
-VERSION = "1.4.0"
+VERSION = "1.5.0"
 AUTHZ_FILENAME = ".js_recon_authorization"
 
 
@@ -1255,10 +1255,18 @@ def analyze_js_source(source, meta):
     }
 
 
+def _stable_marker(finding):
+    """Deterministic per-finding marker so Copy PoC, Fire, Screenshot and
+    Export all reference the same value and can be correlated."""
+    import hashlib
+    basis = u"%s|%s|%s" % (finding.get("sinkType", ""), finding.get("line", ""),
+                           finding.get("snippet", ""))
+    return "JSRECON-" + hashlib.md5(basis.encode("utf-8")).hexdigest()[:10]
+
+
 def payload_for_finding(finding):
-    import time
     sink = finding.get("sinkType", "")
-    marker = "JSRECON-%d" % int(time.time() * 1000)
+    marker = _stable_marker(finding)
     templates = {
         "innerHTML": '<img src=x onerror="console.warn(\'%s\');alert(\'%s\')">' % (marker, marker),
         "outerHTML": '<img src=x onerror="console.warn(\'%s\');alert(\'%s\')">' % (marker, marker),
@@ -1282,6 +1290,61 @@ def payload_for_finding(finding):
     }
     payload = templates.get(sink, '<img src=x onerror="alert(\'%s\')">' % marker)
     return marker, payload
+
+
+# Sources that can be driven straight from a URL (so firing can be automated).
+_URL_SOURCE_KEYS = set(["location.hash", "location.search", "urlsearchparams",
+                        "location.pathname", "location.href", "document.url",
+                        "document.documenturi", "location"])
+
+
+def _url_encode(value):
+    try:
+        from java.net import URLEncoder
+        return _u(URLEncoder.encode(value, "UTF-8")).replace("+", "%20")
+    except Exception:
+        out = []
+        for ch in value:
+            if ch.isalnum() or ch in "-_.~":
+                out.append(ch)
+            else:
+                for b in ch.encode("utf-8"):
+                    out.append("%%%02X" % (ord(b) if isinstance(b, str) else b))
+        return "".join(out)
+
+
+def build_test_url(page_url, source_key, payload):
+    """Best-effort live test URL that drives a URL-based source with the
+    payload. Returns (url, note) or (None, reason) for sources that need a
+    manual trigger (postMessage/cookie/storage/referrer/window.name)."""
+    page_url = (page_url or "").strip()
+    if not page_url:
+        return None, "Set the target page URL (the page that loads the vulnerable script)."
+    if source_key not in _URL_SOURCE_KEYS:
+        return None, "This source (%s) cannot be driven from a URL; use the manual trigger steps." % source_key
+    base = page_url.split("#")[0]
+    if source_key == "location.hash":
+        return base + "#" + payload, "Payload placed in the URL fragment (after #)."
+    if source_key in ("location.search", "urlsearchparams"):
+        sep = "&" if "?" in base else "?"
+        return base + sep + "xss=" + _url_encode(payload), \
+            "Payload placed in query parameter 'xss' (URL-encoded); rename it to the parameter this code reads."
+    # pathname / href / url / bare location: fragment is the safest generic carrier.
+    return base + "#" + payload, "Payload placed in the URL fragment as a best-effort carrier; adjust if the code reads the path."
+
+
+EXECUTION_GUIDE = [
+    "Confirm the sink and source in the vulnerable line below.",
+    "Build the test input: put the payload into the client-controllable source "
+    "(URL fragment/query, postMessage, storage, cookie, etc.) as described per finding.",
+    "Open the target page in a browser with the payload in place (the extension's "
+    "'Fire in browser' does this for URL-based sources).",
+    "Trigger the code path that reaches the sink (load, click, route change, or send "
+    "the postMessage), if it is not reached on page load.",
+    "Observe the result: a JavaScript alert box and a console warning, both showing "
+    "the unique marker, confirm execution.",
+    "Capture a screenshot of the alert for the report (the extension can attach it).",
+]
 
 
 # Which execution context the payload lands in, for replication wording.
@@ -1550,6 +1613,8 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener, IContextMenuFactory, IExt
         self._seen_js = 0
         self._skip_scope = 0
         self._skip_filter = 0
+        # marker -> {"b64": <png base64>, "bytes": <java byte[]>} screenshot proof
+        self._shots = {}
 
         self._build_ui()
         callbacks.addSuiteTab(self)
@@ -1784,12 +1849,31 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener, IContextMenuFactory, IExt
         toolbar.add(gen_all_btn)
         toolbar.add(export_pocs_btn)
 
+        # Second row: active DOM XSS verification (scope-gated, user-initiated).
+        toolbar2 = JPanel()
+        toolbar2.add(JLabel("Target page URL"))
+        self._page_url_field = JTextField(26)
+        self._page_url_field.setToolTipText("The page that LOADS the vulnerable script (not the .js URL). Prefilled from the selected finding's host; edit as needed.")
+        toolbar2.add(self._page_url_field)
+        fire_btn = JButton("Fire in browser", actionPerformed=self._on_fire_in_browser)
+        fire_btn.setToolTipText("Build the test URL for the selected DOM XSS finding and open it in your default browser (in-scope hosts only). Active test -- confirms before opening.")
+        shot_btn = JButton("Capture screenshot", actionPerformed=self._on_capture_screenshot)
+        shot_btn.setToolTipText("Capture the current screen (showing the alert) and attach it to the selected finding for the PoC report.")
+        attach_btn = JButton("Attach screenshot file", actionPerformed=self._on_attach_screenshot)
+        attach_btn.setToolTipText("Attach an existing image file as the screenshot proof for the selected finding.")
+        toolbar2.add(fire_btn)
+        toolbar2.add(shot_btn)
+        toolbar2.add(attach_btn)
+
         self._status = JLabel("Ready")
         statusbar = JPanel(BorderLayout())
         statusbar.add(self._status, BorderLayout.WEST)
 
+        toolbars = JPanel(GridLayout(2, 1))
+        toolbars.add(toolbar)
+        toolbars.add(toolbar2)
         top = JPanel(BorderLayout())
-        top.add(toolbar, BorderLayout.NORTH)
+        top.add(toolbars, BorderLayout.NORTH)
         top.add(banner, BorderLayout.CENTER)
 
         # Main tabbed pane
@@ -2099,6 +2183,11 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener, IContextMenuFactory, IExt
                     skipped += 1
                     continue
                 rec = poc_details(finding, source_file=item["url"], host=item["host"])
+                shot = self._shots.get(rec["marker"])
+                if shot:
+                    rec["shot_b64"] = shot["b64"]
+                    rec["shot_mime"] = shot.get("mime", "image/png")
+                    rec["shot_bytes"] = shot.get("bytes")
                 records.append(rec)
         # Highest severity first.
         order = {"HIGH": 0, "MEDIUM": 1, "LOW": 2, "INFO": 3}
@@ -2148,6 +2237,14 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener, IContextMenuFactory, IExt
         for n, r in enumerate(records, 1):
             steps = u"".join(u"<li>%s</li>" % _esc(s) for s in r["steps"])
             c = sev_color.get(r["severity"], "#4a5568")
+            if r.get("shot_b64"):
+                shot = (u'<h3>Screenshot (popup proof)</h3>'
+                        u'<img class="shot" src="data:%s;base64,%s" alt="DOM XSS alert %s">' % (
+                            r.get("shot_mime", "image/png"), r["shot_b64"], _esc(r["marker"])))
+            else:
+                shot = (u'<h3>Screenshot (popup proof)</h3>'
+                        u'<p class="noshot">No screenshot attached. Fire the PoC, then use '
+                        u'"Capture screenshot" or "Attach screenshot file" on this finding.</p>')
             blocks.append(u"""
   <section class="poc">
     <h2>%d. <span class="sev" style="background:%s">%s</span> DOM XSS via <code>%s</code></h2>
@@ -2166,13 +2263,17 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener, IContextMenuFactory, IExt
     <pre class="payload">%s</pre>
     <h3>Steps to reproduce</h3>
     <ol>%s</ol>
+    %s
   </section>""" % (
                 n, c, _esc(r["severity"]), _esc(r["sink"]),
                 _esc(r["sourceFile"]), r["line"], _esc(r["host"]),
                 _esc(r["sink"]), _esc(r.get("target", "")),
                 "yes (heuristic)" if r["tainted"] else "not confirmed",
                 _esc(r["source"]), _esc(r["context"]), _esc(r["marker"]),
-                _esc(r["snippet"]), _esc(r["payload"]), steps))
+                _esc(r["snippet"]), _esc(r["payload"]), steps, shot))
+        guide = u"".join(u"<li>%s</li>" % _esc(s) for s in EXECUTION_GUIDE)
+        how_to = (u'<h2>How to execute a DOM XSS (general method)</h2>'
+                  u'<ol class="guide">%s</ol>' % guide)
         note = (u"<p class='note'>%d finding(s) were omitted because their host is not in "
                 u"Burp's Target scope.</p>" % skipped) if skipped else u""
         html = u"""<!doctype html><html><head><meta charset="utf-8">
@@ -2189,20 +2290,30 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener, IContextMenuFactory, IExt
  code{background:#f1f5f9;padding:1px 4px;border-radius:3px}
  .note{background:#fffbea;border:1px solid #f0d878;padding:8px 12px;border-radius:6px}
  .disc{background:#fffbea;border:1px solid #f0d878;padding:10px 14px;border-radius:6px;font-size:13px}
+ img.shot{max-width:100%%;border:1px solid #cbd5e0;border-radius:6px;margin-top:6px}
+ .noshot{color:#718096;font-style:italic}
+ ol.guide li{margin:3px 0}
 </style></head><body>
 <h1>DOM XSS Proof-of-Concept Payloads</h1>
 <p><b>Generated:</b> %s &nbsp; <b>Findings:</b> %d</p>
 <div class="disc">Each payload embeds a unique marker and, if executed, raises an alert and a console warning for unambiguous confirmation. Use only against hosts you are authorized to test. Findings are from static analysis and must be confirmed manually.</div>
 %s
 %s
-</body></html>""" % (_esc(gen), len(records), note, u"".join(blocks))
+%s
+</body></html>""" % (_esc(gen), len(records), how_to, note, u"".join(blocks))
         with codecs.open(path, "w", "utf-8") as f:
             f.write(html)
 
     def _write_poc_md(self, path, records, skipped):
+        import os
         gen = _u(SimpleDateFormat("yyyy-MM-dd HH:mm:ss z").format(Date()))
+        base_dir = os.path.dirname(path) or "."
         out = [u"# DOM XSS Proof-of-Concept Payloads", u"",
-               u"Generated: %s  |  Findings: %d" % (gen, len(records)), u""]
+               u"Generated: %s  |  Findings: %d" % (gen, len(records)), u"",
+               u"## How to execute a DOM XSS (general method)", u""]
+        for i, s in enumerate(EXECUTION_GUIDE, 1):
+            out.append(u"%d. %s" % (i, s))
+        out.append(u"")
         if skipped:
             out.append(u"> %d finding(s) omitted (host not in Burp Target scope)." % skipped)
             out.append(u"")
@@ -2233,6 +2344,21 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener, IContextMenuFactory, IExt
             out.append(u"")
             for i, s in enumerate(r["steps"], 1):
                 out.append(u"%d. %s" % (i, s))
+            out.append(u"")
+            out.append(u"**Screenshot (popup proof):**")
+            out.append(u"")
+            if r.get("shot_bytes") is not None:
+                png_name = u"poc-%s.png" % r["marker"]
+                try:
+                    from java.io import File as _JFile, FileOutputStream
+                    fos = FileOutputStream(_JFile(base_dir, png_name))
+                    fos.write(r["shot_bytes"])
+                    fos.close()
+                    out.append(u"![DOM XSS alert %s](%s)" % (r["marker"], png_name))
+                except Exception:
+                    out.append(u"_(screenshot captured; could not write %s)_" % png_name)
+            else:
+                out.append(u"_No screenshot attached. Fire the PoC, then use \"Capture screenshot\" or \"Attach screenshot file\" on this finding._")
             out.append(u"")
         with codecs.open(path, "w", "utf-8") as f:
             f.write(u"\n".join(out))
@@ -2299,21 +2425,143 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener, IContextMenuFactory, IExt
         model_row = self._files_table.convertRowIndexToModel(row)
         return self._files_model.rows.get(model_row)
 
-    def _on_copy_poc(self, evt):
+    def _selected_xss(self, action):
+        """(item, finding) for the selected DOM XSS row, or (None, None)."""
         row = self._xss_table.getSelectedRow()
         if row < 0:
-            self._notify("Copy PoC: select a finding in the DOM XSS table.")
-            return
+            self._notify("%s: select a finding in the DOM XSS table." % action)
+            return None, None
         idx = self._xss_table.convertRowIndexToModel(row)
         if idx >= len(self._xss_findings):
-            self._notify("Copy PoC: selection is out of range.")
+            self._notify("%s: selection is out of range." % action)
+            return None, None
+        return self._xss_by_row[idx], self._xss_findings[idx]
+
+    def _on_copy_poc(self, evt):
+        item, finding = self._selected_xss("Copy PoC")
+        if finding is None:
             return
-        # Use the file the finding came from (previously this used whatever
-        # was selected in the JS Files tab, so the authorization host check
-        # could be made against the wrong host).
-        item = self._xss_by_row[idx]
-        finding = self._xss_findings[idx]
         self._generate_and_copy(item, finding)
+
+    # -- Active verification (scope-gated, user-initiated) -------------------
+    def _default_page_url(self, item):
+        field = _u(self._page_url_field.getText()).strip()
+        if field:
+            return field
+        # Default to the host root of the file's host (user edits if the
+        # vulnerable script runs on a specific page).
+        try:
+            return u"https://%s/" % _u(item["host"])
+        except Exception:
+            return u""
+
+    def _on_fire_in_browser(self, evt):
+        item, finding = self._selected_xss("Fire in browser")
+        if finding is None:
+            return
+        if not self._is_authorized(item):
+            self._blocked(item)
+            return
+        marker, payload = payload_for_finding(finding)
+        rec = poc_details(finding, source_file=item["url"], host=item["host"])
+        page_url = self._default_page_url(item)
+        self._page_url_field.setText(page_url)
+        test_url, note = build_test_url(page_url, finding.get("sourceKey"), payload)
+        if not test_url:
+            JOptionPane.showMessageDialog(
+                self._root,
+                u"Automatic firing is only available for URL-based sources.\n\n"
+                u"Source: %s\nReason: %s\n\nUse these manual steps:\n- %s" % (
+                    rec["source"], note, u"\n- ".join(rec["steps"])),
+                "JS Recon - Fire in browser", JOptionPane.INFORMATION_MESSAGE)
+            return
+        # Editable confirmation: the user sees and can fix the exact URL before
+        # anything opens. This is an ACTIVE test against the live target.
+        edited = JOptionPane.showInputDialog(
+            self._root,
+            u"This will OPEN the live target in your default browser to fire a DOM XSS PoC.\n"
+            u"Host is in Burp scope (authorized). %s\n\n"
+            u"Review/edit the exact URL, then OK to open (Cancel to abort):" % note,
+            test_url)
+        if edited is None:
+            self._status.setText("Fire cancelled.")
+            return
+        edited = _u(edited).strip()
+        if not edited:
+            return
+        try:
+            from java.awt import Desktop
+            from java.net import URI
+            if Desktop.isDesktopSupported() and Desktop.getDesktop().isSupported(Desktop.Action.BROWSE):
+                Desktop.getDesktop().browse(URI(edited))
+                msg = u"Opened PoC URL in default browser (marker %s). When the alert shows, click 'Capture screenshot'." % marker
+                self._log(msg)
+                self._status.setText(msg)
+            else:
+                self._clip(edited)
+                self._notify("Desktop browse not supported here; the URL was copied to the clipboard - paste it into your browser.")
+        except Exception as e:
+            self._clip(edited)
+            self._notify("Could not open browser (%s); URL copied to clipboard instead." % e)
+
+    def _clip(self, text):
+        try:
+            Toolkit.getDefaultToolkit().getSystemClipboard().setContents(StringSelection(text), None)
+        except Exception:
+            pass
+
+    def _on_capture_screenshot(self, evt):
+        item, finding = self._selected_xss("Capture screenshot")
+        if finding is None:
+            return
+        marker = _stable_marker(finding)
+        try:
+            from java.awt import Robot, Rectangle
+            from javax.imageio import ImageIO
+            from java.io import ByteArrayOutputStream
+            from java.util import Base64
+            dim = Toolkit.getDefaultToolkit().getScreenSize()
+            img = Robot().createScreenCapture(Rectangle(0, 0, dim.width, dim.height))
+            baos = ByteArrayOutputStream()
+            ImageIO.write(img, "png", baos)
+            data = baos.toByteArray()
+            b64 = _u(Base64.getEncoder().encodeToString(data))
+            self._shots[marker] = {"b64": b64, "bytes": data}
+            msg = u"Screenshot captured and attached to finding %s (%d bytes). It will appear in the PoC report." % (marker, len(data))
+            self._log(msg)
+            self._status.setText(msg)
+        except Exception as e:
+            self._notify("Screenshot capture failed (%s). Use 'Attach screenshot file' instead." % e)
+
+    def _on_attach_screenshot(self, evt):
+        item, finding = self._selected_xss("Attach screenshot")
+        if finding is None:
+            return
+        marker = _stable_marker(finding)
+        try:
+            from javax.swing import JFileChooser
+            from javax.swing.filechooser import FileNameExtensionFilter
+            chooser = JFileChooser()
+            chooser.setFileFilter(FileNameExtensionFilter("Images (png, jpg, gif)", ["png", "jpg", "jpeg", "gif"]))
+            if chooser.showOpenDialog(self._root) != JFileChooser.APPROVE_OPTION:
+                return
+            f = chooser.getSelectedFile()
+            from java.nio.file import Files
+            from java.util import Base64
+            data = Files.readAllBytes(f.toPath())
+            b64 = _u(Base64.getEncoder().encodeToString(data))
+            ext = _u(f.getName()).lower()
+            mime = "image/png"
+            if ext.endswith((".jpg", ".jpeg")):
+                mime = "image/jpeg"
+            elif ext.endswith(".gif"):
+                mime = "image/gif"
+            self._shots[marker] = {"b64": b64, "bytes": data, "mime": mime}
+            msg = u"Attached %s to finding %s. It will appear in the PoC report." % (f.getName(), marker)
+            self._log(msg)
+            self._status.setText(msg)
+        except Exception as e:
+            self._notify("Attach screenshot failed: %s" % e)
 
     def _generate_and_copy(self, item, finding):
         if not self._is_authorized(item):

@@ -146,6 +146,29 @@ def poc_scope():
     recs, skipped = ext._collect_pocs()
     return "recs=%d (expect 0 for out-of-scope)" % len(recs)
 step("Export PoCs: out-of-scope excluded", poc_scope)
+step("build_test_url hash", lambda: M.build_test_url("https://t.test/p", "location.hash", "<x>")[0])
+step("build_test_url search encodes", lambda: ("xss=" in M.build_test_url("https://t.test/p?a=1", "location.search", "<x>")[0]) and ("%3C" in M.build_test_url("https://t.test/p", "location.search", "<x>")[0]))
+step("build_test_url non-url source -> None", lambda: M.build_test_url("https://t.test/p", ".data", "<x>")[0] is None)
+step("stable marker deterministic", lambda: (M._stable_marker({"sinkType":"innerHTML","line":2,"snippet":"el.innerHTML=q;"}) == M._stable_marker({"sinkType":"innerHTML","line":2,"snippet":"el.innerHTML=q;"})))
+def shot_export():
+    ext._on_clear(None); flush()
+    ext.processHttpMessage(4, False, Msg("https://t.test/s.js", "var q=location.hash; el.innerHTML=q;", "application/javascript")); flush()
+    # attach a fake screenshot to the first finding's stable marker
+    recs, _ = ext._collect_pocs()
+    mk = recs[0]["marker"]
+    from java.util import Base64
+    from java.lang import String as JS
+    fake = JS("PNGDATA").getBytes("UTF-8")
+    ext._shots[mk] = {"b64": Base64.getEncoder().encodeToString(fake), "bytes": fake, "mime":"image/png"}
+    hp = sys.argv[4]+"/pocs_shot.html"; mp = sys.argv[4]+"/pocs_shot.md"
+    recs, skipped = ext._collect_pocs()
+    ext._write_poc_html(hp, recs, skipped); ext._write_poc_md(mp, recs, skipped)
+    html=open(hp).read(); md=open(mp).read()
+    import os
+    html_ok = ("data:image/png;base64," in html) and ("How to execute" in html)
+    md_ok = (("poc-%s.png"%mk) in md) and os.path.exists(sys.argv[4]+"/poc-%s.png"%mk) and ("How to execute" in md)
+    return "html_shot+guide=%s md_pngref+guide=%s" % (html_ok, md_ok)
+step("Screenshot embeds in HTML + PNG file for MD + guide", shot_export)
 def find(term):
     flush(); ext._search_field.setText(term); ext._on_search(None)
     return (ext._files_table.getRowCount(), ext._endpoint_table.getRowCount(), ext._secret_table.getRowCount(), ext._xss_table.getRowCount(), ext._status.getText()[:30])
