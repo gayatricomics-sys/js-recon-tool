@@ -1,4 +1,4 @@
-JS Recon - Burp Suite extension (offline package)  v1.1.1
+JS Recon - Burp Suite extension (offline package)  v1.2.0
 =========================================================
 
 Everything needed is in this folder. No internet access is required.
@@ -21,18 +21,24 @@ INSTALL (offline)
    jython-standalone-2.7.4.jar from this folder.
 3. Extensions -> Installed -> Add -> Extension type: Python ->
    select js_recon_burp.py -> Next.
-4. The Output tab should show "[JS Recon] JS Recon 1.1.1 loaded." and the
+4. The Output tab should show "[JS Recon] JS Recon 1.2.0 loaded." and the
    Errors tab should be empty. A new "JS Recon" tab appears.
 
 USE
 ---
-- Browse the authorized target through Burp Proxy. JavaScript responses
-  (by response Content-Type, or .js/.mjs/.cjs path) are analyzed automatically.
+- Add your target to Burp's scope (Target -> Site map -> right-click host ->
+  Add to scope). Burp's Target scope IS the authorization: no host box or
+  checkbox to fill in. Out-of-scope hosts stay passive (no PoCs).
+- Browse the target through Burp Proxy. JavaScript responses (by response
+  Content-Type, Burp's MIME detection, or .js/.mjs/.cjs path) from in-scope
+  hosts are analyzed automatically. Untick "In-scope only" to capture all JS.
 - Right-click any request in Proxy / HTTP history / Repeater -> Send to JS Recon.
+- Find: type text and press Enter (or Find). All tables are filtered to
+  matching rows, the status bar shows the counts, and the first match is
+  highlighted in the JS Files source view. Empty the box + Find to show all.
 - Host filter: type a host and press Enter to re-filter existing findings.
-- DOM XSS tab: select a row, tick the authorization box for that exact host,
-  then "Copy PoC" copies a marker payload to the clipboard. Nothing is sent
-  automatically; you test it manually.
+- DOM XSS tab: select a row -> "Copy PoC" copies a marker payload for an
+  in-scope host. Nothing is sent automatically; you test it manually.
 - Export CSV / Export HTML write UTF-8 files (HTML output is escaped).
 
 SELF-TEST (optional, offline)

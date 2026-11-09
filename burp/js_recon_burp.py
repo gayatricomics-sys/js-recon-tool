@@ -15,7 +15,7 @@ Features
   * DOM XSS tab: static sink findings with best-effort taint heuristics
   * PoC payload generation per DOM-XSS finding (copy to clipboard)
   * Scope / host filtering, text search, CSV + HTML export, live log
-  * Authorization gate before generating active PoC payloads
+  * Burp Target scope is the authorization: PoCs only for in-scope hosts
 
 This extension is passive and does not attack or modify traffic.
 """
@@ -30,10 +30,12 @@ from javax.swing import (JPanel, JLabel, JTextField, JButton, JCheckBox, JComboB
                          JTable, JTextArea, JScrollPane, JTabbedPane, JSplitPane,
                          SwingConstants, ListSelectionModel, SwingUtilities, BorderFactory,
                          JMenuBar, JMenu, JMenuItem, JOptionPane, JPasswordField)
+from javax.swing import RowFilter
 from javax.swing.table import AbstractTableModel, TableRowSorter
 from javax.swing.event import ListSelectionListener
 from java.lang import Runnable, Thread, System, String as JString, Long
 from java.util import ArrayList
+from java.net import URL
 from java.io import File, PrintWriter, BufferedWriter, FileWriter
 from java.text import SimpleDateFormat
 from java.util import Date
@@ -51,7 +53,7 @@ import re
 import time
 
 
-VERSION = "1.1.1"
+VERSION = "1.2.0"
 AUTHZ_FILENAME = ".js_recon_authorization"
 
 
@@ -675,6 +677,25 @@ def _csv_cell(value):
     return text
 
 
+class _PyRowFilter(RowFilter):
+    """Table filter for Find. With `fn`, keeps model rows where fn(row) is
+    true; otherwise keeps rows where any cell contains `term` (lowercase)."""
+    def __init__(self, fn=None, term=None):
+        self._fn = fn
+        self._term = term
+
+    def include(self, entry):
+        try:
+            if self._fn is not None:
+                return bool(self._fn(entry.getIdentifier()))
+            for i in range(entry.getValueCount()):
+                if self._term in _u(entry.getStringValue(i)).lower():
+                    return True
+            return False
+        except Exception:
+            return True
+
+
 class FilesTableModel(AbstractTableModel):
     columns = ["#", "URL", "Lines", "Endpoints", "Secrets", "DOM XSS", "Frameworks"]
 
@@ -779,8 +800,6 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener, IContextMenuFactory, IExt
         self._next_id = 1
         self._lock = threading.RLock()
         self._host_cache = set()
-        self._authz_host = None
-        self._authz_checked = False
 
         self._build_ui()
         callbacks.addSuiteTab(self)
@@ -934,39 +953,36 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener, IContextMenuFactory, IExt
         self._by_url = {}
         self._host_filter_cache = set()
 
-        # Authorization banner
+        # Authorization banner: Burp's Target scope IS the authorization. Hosts
+        # you add to Target -> Scope are treated as authorized automatically;
+        # there is no separate host box or checkbox to fill in.
         banner = JPanel(GridBagLayout())
         banner.setBorder(BorderFactory.createCompoundBorder(
             BorderFactory.createEmptyBorder(4, 8, 4, 8),
-            BorderFactory.createTitledBorder("Authorization gate")))
+            BorderFactory.createTitledBorder("Authorization = Burp Target scope")))
         banner.setBackground(Color(0xFF, 0xF6, 0xE5))
         gbc = GridBagConstraints()
         gbc.gridx = 0
         gbc.gridy = 0
         gbc.anchor = GridBagConstraints.WEST
         gbc.insets = Insets(2, 2, 2, 6)
-        banner.add(JLabel("Host"), gbc)
-        gbc.gridx = 1
-        self._authz_host_field = JTextField(20)
-        banner.add(self._authz_host_field, gbc)
-        gbc.gridx = 2
-        self._authz_check = JCheckBox("I am authorized to actively test this host")
-        self._authz_check.addActionListener(self._on_authz_changed)
-        banner.add(self._authz_check, gbc)
-        gbc.gridx = 3
-        self._authz_status = JLabel("Inactive (passive-only mode)")
+        self._authz_status = JLabel(
+            "Hosts in Burp's Target scope are treated as authorized targets. "
+            "PoC payloads are only generated for in-scope URLs; out-of-scope hosts stay passive.")
         banner.add(self._authz_status, gbc)
-        self._root.add(banner, BorderLayout.NORTH)
 
         # Toolbar
         toolbar = JPanel()
         self._auto_capture = JCheckBox("Passive capture", True)
-        self._scope_only = JCheckBox("In-scope only", False)
+        # Default ON: only the target(s) you added to Burp scope are captured.
+        self._scope_only = JCheckBox("In-scope only", True)
+        self._scope_only.setToolTipText("Capture only URLs in Burp's Target scope. Untick to capture all JavaScript seen by the proxy.")
         self._host_filter = JTextField(14)
         # Press Enter in the host filter to re-apply it to existing findings.
         self._host_filter.addActionListener(lambda evt: self._refresh_tables())
-        search_btn = JButton("Search", actionPerformed=self._on_search)
         self._search_field = JTextField(18)
+        self._search_field.setToolTipText("Text to find in URLs, source, endpoints, secrets and DOM XSS rows. Press Enter or Find; empty + Find shows all.")
+        self._search_field.addActionListener(self._on_search)  # Enter runs Find
         search_btn2 = JButton("Find", actionPerformed=self._on_search)
         clear_btn = JButton("Clear", actionPerformed=self._on_clear)
         export_csv_btn = JButton("Export CSV", actionPerformed=self._on_export_csv)
@@ -1000,7 +1016,8 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener, IContextMenuFactory, IExt
         # Files tab
         self._files_model = FilesTableModel()
         self._files_table = JTable(self._files_model)
-        self._files_table.setRowSorter(TableRowSorter(self._files_model))
+        self._files_sorter = TableRowSorter(self._files_model)
+        self._files_table.setRowSorter(self._files_sorter)
         self._files_table.setSelectionMode(ListSelectionModel.SINGLE_SELECTION)
         self._files_table.getSelectionModel().addListSelectionListener(self._on_file_selected)
         files_split = JSplitPane(JSplitPane.HORIZONTAL_SPLIT)
@@ -1018,21 +1035,24 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener, IContextMenuFactory, IExt
         # Endpoints tab
         self._endpoint_model = SimpleTableModel(["URL", "Kind", "Host", "Path", "Query", "Line", "Source File"])
         self._endpoint_table = JTable(self._endpoint_model)
-        self._endpoint_table.setRowSorter(TableRowSorter(self._endpoint_model))
+        self._endpoint_sorter = TableRowSorter(self._endpoint_model)
+        self._endpoint_table.setRowSorter(self._endpoint_sorter)
         self._endpoint_table.setSelectionMode(ListSelectionModel.SINGLE_SELECTION)
         self._tabs.addTab("Endpoints", JScrollPane(self._endpoint_table))
 
         # Secrets tab
         self._secret_model = SimpleTableModel(["Type", "Redacted", "Length", "Entropy", "Line", "Reason", "Source File"])
         self._secret_table = JTable(self._secret_model)
-        self._secret_table.setRowSorter(TableRowSorter(self._secret_model))
+        self._secret_sorter = TableRowSorter(self._secret_model)
+        self._secret_table.setRowSorter(self._secret_sorter)
         self._secret_table.setSelectionMode(ListSelectionModel.SINGLE_SELECTION)
         self._tabs.addTab("Secrets", JScrollPane(self._secret_table))
 
         # DOM XSS tab
         self._xss_model = SimpleTableModel(["Severity", "Sink", "Target", "Line", "Tainted", "Snippet", "Source File"])
         self._xss_table = JTable(self._xss_model)
-        self._xss_table.setRowSorter(TableRowSorter(self._xss_model))
+        self._xss_sorter = TableRowSorter(self._xss_model)
+        self._xss_table.setRowSorter(self._xss_sorter)
         self._xss_table.setSelectionMode(ListSelectionModel.SINGLE_SELECTION)
         self._tabs.addTab("DOM XSS", JScrollPane(self._xss_table))
 
@@ -1053,16 +1073,23 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener, IContextMenuFactory, IExt
         self._xss_by_row = []
         self._xss_findings = []
 
-    def _on_authz_changed(self, evt):
-        host = str(self._authz_host_field.getText()).strip().lower()
-        if self._authz_check.isSelected() and host:
-            self._authz_host = host
-            self._authz_status.setText("Authorization armed for: %s" % host)
-            self._status.setText("Active-test payloads are authorized for %s." % host)
-        else:
-            self._authz_host = None
-            self._authz_status.setText("Inactive (passive-only mode)")
-            self._status.setText("Active-test payloads are disabled.")
+    def _is_authorized(self, item):
+        """A file's host is authorized when its URL is in Burp's Target scope."""
+        try:
+            return bool(self._callbacks.isInScope(URL(item["url"])))
+        except Exception:
+            return False
+
+    def _notify(self, msg):
+        """Message the user can see right away (status bar) and in the Log tab."""
+        self._log(msg)
+        self._status.setText(_u(msg))
+
+    def _blocked(self, item):
+        msg = (u"Blocked: %s is not in Burp's Target scope. Add it under Target -> Scope "
+               u"(right-click the host -> Add to scope) to generate PoCs." % item["host"])
+        self._log(msg)
+        self._status.setText(msg)
 
     def _on_file_selected(self, evt):
         row = self._files_table.getSelectedRow()
@@ -1177,25 +1204,58 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener, IContextMenuFactory, IExt
         self._log("Cleared all captured JS files and findings.")
 
     def _on_search(self, evt):
-        term = str(self._search_field.getText()).strip().lower()
+        """Find: filters every table to matching rows (previously it only
+        wrote to the Log tab, so it looked like nothing happened). An empty
+        search box + Find clears the filter."""
+        term = _u(self._search_field.getText()).strip().lower()
+        sorters = (self._files_sorter, self._endpoint_sorter, self._secret_sorter, self._xss_sorter)
         if not term:
-            self._log("Search: enter a term.")
+            for sorter in sorters:
+                sorter.setRowFilter(None)
+            self._status.setText("Find cleared - showing all rows.")
+            self._update_stats()
             return
-        matched_files = []
-        for item in self._snapshot():
-            hay = " ".join([
-                item["url"],
-                item["summary"],
-                " ".join(e["raw"] for e in item["endpoints"]),
-                " ".join(s["redacted"] for s in item["secrets"]),
-                " ".join(x["snippet"] for x in item["xss"]),
-                item["source"],
-            ]).lower()
-            if term in hay:
-                matched_files.append(item["url"])
-        self._log("Search '%s': %d file(s) matched." % (term, len(matched_files)))
-        for url in matched_files[:100]:
-            self._log("  %s" % url)
+
+        files_rows = self._files_model.rows
+
+        def file_matches(model_row):
+            item = files_rows.get(model_row)
+            return (term in item["url"].lower() or term in item["summary"].lower()
+                    or term in item["source"].lower())
+
+        self._files_sorter.setRowFilter(_PyRowFilter(file_matches))
+        for sorter in sorters[1:]:
+            sorter.setRowFilter(_PyRowFilter(None, term))
+
+        counts = (self._files_table.getRowCount(), self._endpoint_table.getRowCount(),
+                  self._secret_table.getRowCount(), self._xss_table.getRowCount())
+        msg = (u"Find '%s': %d file(s), %d endpoint(s), %d secret(s), %d DOM XSS row(s) match. "
+               u"Empty the box and click Find to show all." % ((term,) + counts))
+        self._status.setText(msg)
+        self._log(msg)
+
+        if counts[0]:
+            # Open the first matching file and highlight the first hit in its source.
+            self._files_table.setRowSelectionInterval(0, 0)
+            text = _u(self._file_detail.getText())
+            pos = text.lower().find(term)
+            if pos >= 0:
+                self._file_detail.requestFocusInWindow()
+                self._file_detail.select(pos, pos + len(term))
+        # If the visible tab has no hits, switch to the first tab that has some.
+        tab_counts = {0: counts[0], 1: counts[1], 2: counts[2], 3: counts[3]}
+        current = self._tabs.getSelectedIndex()
+        if tab_counts.get(current, 1) == 0:
+            for idx in (0, 1, 2, 3):
+                if tab_counts[idx]:
+                    self._tabs.setSelectedIndex(idx)
+                    break
+        if not any(counts):
+            try:
+                JOptionPane.showMessageDialog(self._root, u"No matches for '%s'." % term,
+                                              "JS Recon - Find", JOptionPane.INFORMATION_MESSAGE)
+            except Exception:
+                pass  # headless (self-test); the status bar already says 0 matches
 
     def _on_export_csv(self, evt):
         chooser = None
@@ -1295,11 +1355,11 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener, IContextMenuFactory, IExt
     def _on_copy_poc(self, evt):
         row = self._xss_table.getSelectedRow()
         if row < 0:
-            self._log("Copy PoC: select a finding in the DOM XSS table.")
+            self._notify("Copy PoC: select a finding in the DOM XSS table.")
             return
         idx = self._xss_table.convertRowIndexToModel(row)
         if idx >= len(self._xss_findings):
-            self._log("Copy PoC: selection is out of range.")
+            self._notify("Copy PoC: selection is out of range.")
             return
         # Use the file the finding came from (previously this used whatever
         # was selected in the JS Files tab, so the authorization host check
@@ -1309,22 +1369,23 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener, IContextMenuFactory, IExt
         self._generate_and_copy(item, finding)
 
     def _generate_and_copy(self, item, finding):
-        if not self._authz_check.isSelected() or self._authz_host != item["host"].lower():
-            self._log("Blocked: authorization checkbox not set for %s." % item["host"])
-            self._status.setText("Authorization required for %s to generate active PoC." % item["host"])
+        if not self._is_authorized(item):
+            self._blocked(item)
             return
         marker, payload = payload_for_finding(finding)
         clipboard = Toolkit.getDefaultToolkit().getSystemClipboard()
         clipboard.setContents(StringSelection(payload), None)
-        self._log("PoC copied to clipboard for %s (marker %s)." % (item["url"], marker))
+        msg = u"PoC copied to clipboard for %s (marker %s)." % (item["url"], marker)
+        self._log(msg)
+        self._status.setText(msg)
 
     def _on_generate_all_pocs(self, evt):
         item = self._selected_item()
         if not item:
-            self._log("Generate all PoCs: select a JS file first.")
+            self._notify("Generate all PoCs: select a JS file first.")
             return
-        if not self._authz_check.isSelected() or self._authz_host != item["host"].lower():
-            self._log("Blocked: authorization checkbox not set for %s." % item["host"])
+        if not self._is_authorized(item):
+            self._blocked(item)
             return
         lines = []
         for idx, x in enumerate(item["xss"]):
