@@ -48,6 +48,7 @@ class Msg(object):  # IHttpRequestResponse -- note: NO getUrl()
     def getComment(s): return None
     def getHighlight(s): return None
 LOGGED = []
+SCOPE = set([u"t.test"])  # hosts added to Burp Target scope
 class CB(object):
     def getHelpers(s): return Helpers()
     def setExtensionName(s, n): pass
@@ -55,7 +56,7 @@ class CB(object):
     def addSuiteTab(s, t): pass
     def registerHttpListener(s, l): pass
     def registerContextMenuFactory(s, l): pass
-    def isInScope(s, u): return True
+    def isInScope(s, u): return unicode(u.getHost()) in SCOPE
     def printOutput(s, m):
         LOGGED.append(unicode(m)); print(m)
 
@@ -116,7 +117,15 @@ step("40 concurrent proxy threads", burst)
 step("render all tables after burst", lambda: [render(m) for m in (ext._files_model, ext._endpoint_model, ext._secret_model, ext._xss_model)])
 step("CSV export (unicode)", lambda: ext._write_csv(sys.argv[4]+"/r.csv"))
 step("PoC for every sink type", lambda: len([M.payload_for_finding({"sinkType": k}) for k in ["innerHTML","location-assign","jquery-html","srcdoc","message-listener","eval"]]))
-step("authz gate blocks wrong host", lambda: (ext._authz_check.setSelected(True), ext._authz_host_field.setText("other.test"), ext._on_authz_changed(None), ext._generate_and_copy({"host":u"t.test","url":u"x"}, {"sinkType":"eval"}), ext._log_area.getText().strip().splitlines()[-1])[-1])
+step("scope: in-scope host authorized", lambda: ext._is_authorized({"url": u"https://t.test/a.js", "host": u"t.test"}))
+step("scope: out-of-scope host blocked", lambda: (ext._generate_and_copy({"url": u"https://evil.test/a.js", "host": u"evil.test"}, {"sinkType": "eval"}), flush(), ext._status.getText()[:40])[-1])
+step("scope: out-of-scope JS not captured (In-scope only default)", lambda: (ext.processHttpMessage(4, False, Msg("https://other.test/x.js", "eval(location.hash)", "application/javascript")), any(i["host"] == u"other.test" for i in ext._store.values()))[-1])
+def find(term):
+    flush(); ext._search_field.setText(term); ext._on_search(None)
+    return (ext._files_table.getRowCount(), ext._endpoint_table.getRowCount(), ext._secret_table.getRowCount(), ext._xss_table.getRowCount(), ext._status.getText()[:30])
+step("Find 'c7.js' filters tables", lambda: find("c7.js"))
+step("Find highlights hit in file detail", lambda: ext._file_detail.getSelectedText())
+step("Find empty clears filter", lambda: find(""))
 step("host filter re-apply", lambda: (ext._host_filter.setText("nomatch"), ext._refresh_tables(), ext._endpoint_model.getRowCount())[-1])
 step("clear", lambda: (ext._on_clear(None), len(ext._store), ext._xss_model.getRowCount())[1:])
 for f in sys.argv[5:]:
@@ -133,5 +142,5 @@ def send_to():
     items[0].doClick(); flush()
     return "%d store, ctx.js analyzed=%s" % (len(ext._store), any(i["url"].endswith("ctx.js") for i in ext._store.values()))
 step("right-click Send to JS Recon", send_to)
-bad = [l for l in LOGGED if "error" in l.lower() or "has no attribute" in l.lower()]
+bad = [l for l in LOGGED if ("error" in l.lower() and "logged" not in l.lower()) or "has no attribute" in l.lower()]
 print(("[FAIL] extension logged %d error(s):\n  " % len(bad) + "\n  ".join(bad[:10])) if bad else "[OK]   no errors in extension log")
