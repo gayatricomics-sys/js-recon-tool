@@ -12,10 +12,19 @@ Features
   * JS Files tab: narrative explanation, framework signatures, source preview
   * Endpoints tab: URL/path candidates from string/template literals
   * Secrets tab: redacted known-prefix, JWT, PEM, sensitive-name, entropy hits
-  * DOM XSS tab: static sink findings with best-effort taint heuristics
+  * DOM XSS tab: token-based sink findings (innerHTML/outerHTML/srcdoc,
+    document.write, insertAdjacentHTML, eval, Function, setTimeout string arg,
+    jQuery html/$(), location & src/href assignment, postMessage handlers)
+  * Sensitive functions surfaced per file; JS is beautified before analysis
   * PoC payload generation per DOM-XSS finding (copy to clipboard)
   * Scope / host filtering, text search, CSV + HTML export, live log
   * Burp Target scope is the authorization: PoCs only for in-scope hosts
+
+Analysis engine (v1.3.0): JavaScript is beautified, then lexed into tokens
+(strings, template literals, comments, regex literals, numbers, names,
+punctuators). Endpoint / secret / DOM-XSS / sensitive-function detection run
+over the token stream -- no regex is run over raw source, so matches never
+land inside string bodies or comments. DOM XSS is the primary focus.
 
 This extension is passive and does not attack or modify traffic.
 """
@@ -53,85 +62,13 @@ import re
 import time
 
 
-VERSION = "1.2.0"
+VERSION = "1.3.0"
 AUTHZ_FILENAME = ".js_recon_authorization"
 
 
 # ---------------------------------------------------------------------------
-# Analysis engine (regex-based port; no external dependencies)
+# Shared helpers
 # ---------------------------------------------------------------------------
-
-HTTP_CALL_RE = re.compile(
-    r"""(?:fetch|axios|\bget|\bpost|\bput|\bpatch|\bdelete|\bhead|\bopen|\brequest)
-        \s*\(\s*(['"`])([^'"`]{1,600}?)\1""",
-    re.VERBOSE | re.IGNORECASE,
-)
-
-STRING_URL_RE = re.compile(
-    r"""['"`]
-        (
-            (?:(?:https?:)?//)[^\s'"`<>]{3,600}
-            | /(?:[A-Za-z0-9\-._~!$&'()*+,;=:@%/]{1,600})
-            | (?:[A-Za-z0-9][A-Za-z0-9\-_.]*/){1,6}[A-Za-z0-9][A-Za-z0-9\-._]*?
-              (?:\?[^'"`\s]{0,400})?
-        )
-    ['"`]""",
-    re.VERBOSE,
-)
-
-TEMPLATE_URL_RE = re.compile(
-    r"""[`]
-        (
-            (?:(?:https?:)?//)[^`]{3,600}
-            | /[^`]{1,600}
-        )
-    [`]""",
-    re.VERBOSE,
-)
-
-SENSITIVE_NAME_RE = re.compile(
-    r"""(?i)(?:api[_-]?key|secret|token|password|passwd|pwd|authorization|auth[_-]?token|
-        access[_-]?key|private[_-]?key|client[_-]?secret|session[_-]?id|credential|bearer)""",
-    re.VERBOSE,
-)
-
-ASSIGN_VALUE_RE = re.compile(
-    r"""(?i)(?:\b(?:api[_-]?key|secret|token|password|passwd|pwd|auth[_-]?token|
-        access[_-]?key|private[_-]?key|client[_-]?secret|session[_-]?id|credential|bearer)
-        \b\s*[:=]\s*)['"]([^'"]{6,512})['"]""",
-    re.VERBOSE,
-)
-
-TAINT_SOURCE_TOKENS = [
-    "location.search", "location.hash", "location.href", "location.pathname",
-    "event.data", "evt.data", "msg.data", "message.data",
-    "document.referrer", "document.url", "document.documenturi",
-    "window.name", "urlsearchparams", "postmessage", "localstorage",
-    "sessionstorage", "document.cookie",
-]
-
-KNOWN_PREFIX_RULES = [
-    ("AWS Access Key ID", ("AKIA", "ASIA"), 20, 20),
-    ("Google API Key", ("AIza",), 39, 39),
-    ("GitHub Token", ("ghp_", "gho_", "ghu_", "ghs_", "ghr_", "github_pat_"), 20, 255),
-    ("Slack Token", ("xoxb-", "xoxp-", "xoxa-", "xoxr-", "xoxs-"), 20, 200),
-    ("Stripe Key", ("sk_live_", "pk_live_", "rk_live_"), 15, 200),
-    ("Stripe Test Key", ("sk_test_", "rk_test_"), 15, 200),
-    ("Anthropic API Key", ("sk-ant-",), 20, 200),
-    ("OpenAI API Key", ("sk-",), 20, 200),
-]
-
-BASE64_CHARS = set("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/=_-")
-
-FRAMEWORK_SIGNATURES = [
-    ("React", ["React.createElement", "react-dom", "_jsx", "__REACT_DEVTOOLS"]),
-    ("Vue", ["Vue.component", "createApp", "__VUE__", "vue-router"]),
-    ("Angular", ["angular.module", "ng-app", "@angular/core"]),
-    ("jQuery", ["jQuery.fn.jquery", "jQuery(", "$.ajax"]),
-    ("Webpack bundle", ["__webpack_require__", "webpackJsonp"]),
-    ("Next.js", ["__NEXT_DATA__", "next/router"]),
-]
-
 
 def entropy(value):
     if not value:
@@ -141,18 +78,494 @@ def entropy(value):
         counts[ch] = counts.get(ch, 0) + 1
     total = float(len(value))
     result = 0.0
-    for count in counts.values():
-        p = count / total
+    for c in counts.values():
+        p = c / total
         result -= p * math.log(p, 2)
     return result
 
 
-# Relative "a/b" strings that are almost never endpoints: MIME types, date
-# formats, fractions/ratios.
-NOISE_SEGMENT_RE = re.compile(
+def redact_value(value):
+    if not value:
+        return ""
+    if len(value) <= 8:
+        return "*" * len(value)
+    return value[:4] + "*" * max(4, len(value) - 8) + value[-4:]
+
+
+def lines_of(source):
+    return source.count("\n") + 1
+
+
+def line_number_of_index(source, index):
+    if index is None or index < 0:
+        return 1
+    return source.count("\n", 0, min(index, len(source))) + 1
+
+
+# ---------------------------------------------------------------------------
+# Tokenizer
+# ---------------------------------------------------------------------------
+
+_ID_START = set("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ_$")
+_DIGITS = set("0123456789")
+_ID_PART = _ID_START | _DIGITS
+_WS = set(" \t\r\f\v\xa0")
+
+# Multi-char punctuators, longest first so ">>>=" wins over ">>>".
+_MULTI_PUNCT = [
+    ">>>=", "===", "!==", "**=", "<<=", ">>=", ">>>", "...",
+    "==", "!=", "<=", ">=", "&&", "||", "??", "?.", "=>", "++", "--",
+    "+=", "-=", "*=", "/=", "%=", "&=", "|=", "^=", "**", "<<", ">>",
+]
+
+# Keywords after which a "/" begins a regex literal, not division.
+_REGEX_KEYWORDS = set([
+    "return", "typeof", "instanceof", "in", "of", "new", "delete", "void",
+    "do", "else", "throw", "case", "yield", "await", "default",
+])
+# Names after which "/" is division (a value precedes it).
+_VALUE_KEYWORDS = set(["this", "super", "true", "false", "null"])
+
+
+class Tok(object):
+    __slots__ = ("type", "value", "start", "line", "raw")
+
+    def __init__(self, type_, value, start, line, raw=None):
+        self.type = type_
+        self.value = value          # decoded text (for strings: no quotes)
+        self.start = start
+        self.line = line
+        self.raw = raw if raw is not None else value  # verbatim source slice
+
+
+def _regex_allowed(prev):
+    if prev is None:
+        return True
+    if prev.type in ("number", "string", "template", "regex"):
+        return False
+    if prev.type == "name":
+        if prev.value in _VALUE_KEYWORDS:
+            return False
+        if prev.value in _REGEX_KEYWORDS:
+            return True
+        return False  # plain identifier -> value -> division
+    if prev.type == "punct":
+        return prev.value not in (")", "]", "}")
+    return True
+
+
+def tokenize(src):
+    tokens = []
+    i = 0
+    n = len(src)
+    line = 1
+    while i < n:
+        c = src[i]
+        if c == "\n":
+            line += 1
+            i += 1
+            continue
+        if c in _WS:
+            i += 1
+            continue
+
+        # Comments
+        if c == "/" and i + 1 < n and src[i + 1] == "/":
+            j = i + 2
+            while j < n and src[j] != "\n":
+                j += 1
+            tokens.append(Tok("comment", src[i:j], i, line))
+            i = j
+            continue
+        if c == "/" and i + 1 < n and src[i + 1] == "*":
+            j = i + 2
+            while j + 1 < n and not (src[j] == "*" and src[j + 1] == "/"):
+                if src[j] == "\n":
+                    line += 1
+                j += 1
+            j = min(n, j + 2)
+            tokens.append(Tok("comment", src[i:j], i, line))
+            i = j
+            continue
+
+        # String literals
+        if c == '"' or c == "'":
+            j = i + 1
+            buf = []
+            while j < n:
+                d = src[j]
+                if d == "\\":
+                    if j + 1 < n:
+                        buf.append(src[j + 1])
+                        j += 2
+                        continue
+                    j += 1
+                    continue
+                if d == c:
+                    j += 1
+                    break
+                if d == "\n":
+                    break  # unterminated; stop at EOL
+                buf.append(d)
+                j += 1
+            t = Tok("string", "".join(buf), i, line, raw=src[i:j])
+            tokens.append(t)
+            i = j
+            continue
+
+        # Template literals (handle ${ } nesting on brace depth)
+        if c == "`":
+            j = i + 1
+            depth = 0
+            while j < n:
+                d = src[j]
+                if d == "\\":
+                    j += 2
+                    continue
+                if d == "\n":
+                    line += 1
+                    j += 1
+                    continue
+                if depth == 0 and d == "`":
+                    j += 1
+                    break
+                if d == "$" and j + 1 < n and src[j + 1] == "{":
+                    depth += 1
+                    j += 2
+                    continue
+                if depth > 0 and d == "{":
+                    depth += 1
+                elif depth > 0 and d == "}":
+                    depth -= 1
+                j += 1
+            tokens.append(Tok("template", src[i:j], i, line))
+            i = j
+            continue
+
+        # Regex literal vs division
+        if c == "/" and _regex_allowed(tokens[-1] if tokens else None):
+            j = i + 1
+            in_class = False
+            ok = True
+            while j < n:
+                d = src[j]
+                if d == "\\":
+                    j += 2
+                    continue
+                if d == "\n":
+                    ok = False
+                    break
+                if d == "[":
+                    in_class = True
+                elif d == "]":
+                    in_class = False
+                elif d == "/" and not in_class:
+                    j += 1
+                    break
+                j += 1
+            if ok and j <= n:
+                while j < n and (src[j] in _ID_PART):
+                    j += 1
+                tokens.append(Tok("regex", src[i:j], i, line))
+                i = j
+                continue
+            # else fall through to punctuator
+
+        # Numbers
+        if c in _DIGITS or (c == "." and i + 1 < n and src[i + 1] in _DIGITS):
+            j = i + 1
+            while j < n and (src[j] in _ID_PART or src[j] == "."):
+                # allow exponent sign
+                if src[j] in "eE" and j + 1 < n and src[j + 1] in "+-":
+                    j += 2
+                    continue
+                j += 1
+            tokens.append(Tok("number", src[i:j], i, line))
+            i = j
+            continue
+
+        # Identifiers / keywords (allow unicode)
+        if c in _ID_START or ord(c) > 127:
+            j = i + 1
+            while j < n and (src[j] in _ID_PART or ord(src[j]) > 127):
+                j += 1
+            tokens.append(Tok("name", src[i:j], i, line))
+            i = j
+            continue
+
+        # Punctuators
+        matched = None
+        for p in _MULTI_PUNCT:
+            if src.startswith(p, i):
+                matched = p
+                break
+        if matched:
+            tokens.append(Tok("punct", matched, i, line))
+            i += len(matched)
+        else:
+            tokens.append(Tok("punct", c, i, line))
+            i += 1
+    return tokens
+
+
+def significant(tokens):
+    return [t for t in tokens if t.type != "comment"]
+
+
+# ---------------------------------------------------------------------------
+# Beautifier (token-driven; for readable source preview + snippets)
+# ---------------------------------------------------------------------------
+
+_KW_SPACE_AFTER = set([
+    "return", "var", "let", "const", "function", "if", "else", "for", "while",
+    "do", "switch", "case", "new", "typeof", "instanceof", "in", "of", "throw",
+    "delete", "void", "yield", "await", "default", "class", "extends",
+])
+_WORD_TYPES = set(["name", "number", "string", "template", "regex"])
+
+
+def beautify(src, max_chars=2000000):
+    if len(src) > max_chars:
+        return src
+    tokens = tokenize(src)
+    if not tokens:
+        return src
+    out = []
+    indent = 0
+    paren = 0
+    at_line_start = True
+
+    def nl():
+        out.append("\n")
+
+    def pad():
+        out.append("  " * max(0, indent))
+
+    prev = None
+    for idx, t in enumerate(tokens):
+        if t.type == "comment":
+            if not at_line_start:
+                nl()
+            pad()
+            out.append(t.value)
+            nl()
+            at_line_start = True
+            prev = t
+            continue
+
+        # Emit the verbatim source for anything whose decoded value differs
+        # from how it must appear in code (strings lose their quotes).
+        v = t.raw if t.type == "string" else t.value
+        if t.type == "punct":
+            if v == "{":
+                if prev is not None and not at_line_start:
+                    out.append(" ")
+                out.append("{")
+                indent += 1
+                nl()
+                pad()
+                at_line_start = True
+                prev = t
+                continue
+            if v == "}":
+                if not at_line_start:
+                    nl()
+                indent -= 1
+                pad()
+                out.append("}")
+                at_line_start = False
+                prev = t
+                continue
+            if v == ";":
+                out.append(";")
+                if paren == 0:
+                    nl()
+                    pad()
+                    at_line_start = True
+                else:
+                    out.append(" ")
+                    at_line_start = False
+                prev = t
+                continue
+            if v == "(":
+                paren += 1
+            elif v == ")":
+                paren = max(0, paren - 1)
+            elif v == ",":
+                out.append(",")
+                out.append(" ")
+                at_line_start = False
+                prev = t
+                continue
+
+        # Start a fresh line after a block close before the next statement.
+        if not at_line_start and prev is not None and prev.type == "punct" and prev.value == "}" \
+                and not (t.type == "punct" and v in (")", "]", "}", ";", ",", ".", "(")):
+            nl()
+            pad()
+            at_line_start = True
+
+        # Spacing before this token
+        if not at_line_start and prev is not None:
+            need = False
+            pv = prev.value
+            if prev.type in _WORD_TYPES and t.type in _WORD_TYPES:
+                need = True
+            if prev.type == "name" and pv in _KW_SPACE_AFTER:
+                need = True
+            if prev.type == "punct" and pv in ("=", "=>", "==", "===", "!=",
+                                               "!==", "<", ">", "<=", ">=", "&&",
+                                               "||", "+", "-", "*", "/", "%", "?",
+                                               ":", "|", "&", "+=", "-=", "=="):
+                need = True
+            if t.type == "punct" and v in ("=", "=>", "==", "===", "!=", "!==",
+                                           "<=", ">=", "&&", "||", "?", ":"):
+                need = True
+            if need:
+                out.append(" ")
+        out.append(v)
+        at_line_start = False
+        prev = t
+    return "".join(out)
+
+
+# ---------------------------------------------------------------------------
+# Member-chain + slice helpers over tokens
+# ---------------------------------------------------------------------------
+
+def chain_backward(sig, idx):
+    """Dotted chain ending at sig[idx] (a name), reading left over .name and
+    ['string']. Returns (chain_list, start_index)."""
+    parts = [sig[idx].value]
+    j = idx - 1
+    start = idx
+    while j >= 1:
+        if sig[j].type == "punct" and sig[j].value in (".", "?."):
+            if sig[j - 1].type == "name":
+                parts.append(sig[j - 1].value)
+                start = j - 1
+                j -= 2
+                continue
+        if sig[j].type == "punct" and sig[j].value == "]":
+            # skip ['...'] -> find matching [
+            depth = 1
+            k = j - 1
+            inner = None
+            while k >= 0 and depth:
+                if sig[k].value == "]":
+                    depth += 1
+                elif sig[k].value == "[":
+                    depth -= 1
+                    if depth == 0:
+                        break
+                k -= 1
+            if k >= 1 and sig[k - 1].type in ("name",) and j - 1 == k + 1 and sig[k + 1].type == "string":
+                parts.append(sig[k + 1].value)
+                start = k - 1
+                parts.append(sig[k - 1].value)
+                j = k - 2
+                continue
+            break
+        break
+    parts.reverse()
+    return parts, start
+
+
+def chain_forward(sig, idx):
+    """Dotted chain starting at sig[idx] (a name), reading right over .name."""
+    parts = [sig[idx].value]
+    j = idx + 1
+    end = idx
+    while j + 1 < len(sig):
+        if sig[j].type == "punct" and sig[j].value in (".", "?.") and sig[j + 1].type == "name":
+            parts.append(sig[j + 1].value)
+            end = j + 1
+            j += 2
+            continue
+        break
+    return parts, end
+
+
+def statement_slice(sig, start, stop_depth_open=0):
+    """Tokens from sig[start] until end of the current expression/statement:
+    a depth-0 ';' or ',' , or a ')'/']'/'}' that closes a level we did not
+    open. Used for RHS of assignments and call arguments."""
+    depth = stop_depth_open
+    out = []
+    j = start
+    while j < len(sig):
+        t = sig[j]
+        if t.type == "punct":
+            if t.value in ("(", "[", "{"):
+                depth += 1
+            elif t.value in (")", "]", "}"):
+                if depth == 0:
+                    break
+                depth -= 1
+            elif depth == 0 and t.value in (";", ","):
+                break
+        out.append(t)
+        j += 1
+    return out, j
+
+
+def slice_text(tokens):
+    return " ".join(t.value for t in tokens)
+
+
+# ---------------------------------------------------------------------------
+# Endpoint extraction
+# ---------------------------------------------------------------------------
+
+HTTP_CALL_NAMES = set([
+    "fetch", "axios", "ajax", "get", "post", "put", "patch", "delete", "head",
+    "open", "request", "sendBeacon", "load",
+])
+
+_URL_SHAPE = re.compile(r"^[A-Za-z0-9_@./:%+\-~!$&'()*,;=?#\[\]{}]+$")
+_NOISE = re.compile(
     r"^(?:(?:application|text|image|audio|video|font|multipart|model|message)/[\w.+\-*]+"
     r"|[dmyhsDMYHS]{1,4}/[dmyhsDMYHS]{1,4}(?:/[dmyhsDMYHS]{1,4})?"
     r"|\d+/\d+)$")
+
+
+def parametrize_template(raw):
+    """`...${x}...` (raw incl backticks) -> text with ${...} => {param}."""
+    s = raw
+    if s.startswith("`"):
+        s = s[1:]
+    if s.endswith("`"):
+        s = s[:-1]
+    out = []
+    i = 0
+    n = len(s)
+    while i < n:
+        if s[i] == "\\" and i + 1 < n:
+            out.append(s[i + 1])
+            i += 2
+            continue
+        if s[i] == "$" and i + 1 < n and s[i + 1] == "{":
+            depth = 1
+            i += 2
+            while i < n and depth:
+                if s[i] == "{":
+                    depth += 1
+                elif s[i] == "}":
+                    depth -= 1
+                i += 1
+            out.append("{param}")
+            continue
+        out.append(s[i])
+        i += 1
+    return "".join(out)
+
+
+def _operand_text(t):
+    if t.type == "string":
+        return t.value, True
+    if t.type == "template":
+        return parametrize_template(t.value), True
+    return "{param}", False
 
 
 def classify_candidate(candidate):
@@ -161,41 +574,66 @@ def classify_candidate(candidate):
         return None
     if "\n" in candidate or "\t" in candidate or " " in candidate:
         return None
+    if _NOISE.match(candidate):
+        return None
     if "://" in candidate:
-        # NOTE: Jython/Python 2.7 sre rejects "([^?#]*)?" ("nothing to repeat"),
-        # which previously crashed analysis of every file containing a full URL.
-        m = re.match(r"^([a-zA-Z][a-zA-Z0-9+.-]*):/{2}([^/?#]+)([^?#]*)(\?[^#]*)?(#.*)?$", candidate)
+        m = re.match(r"^([a-zA-Z][a-zA-Z0-9+.\-]*):/{2}([^/?#]+)([^?#]*)(\?[^#]*)?(#.*)?$", candidate)
         if m:
             return {"kind": "absolute", "protocol": m.group(1), "host": m.group(2),
                     "pathname": m.group(3) or "", "query": m.group(4) or "", "full": candidate}
         return None
-    if candidate.startswith("/") and not candidate.startswith("//"):
+    if candidate.startswith("//") and len(candidate) > 2:
+        return {"kind": "protocol-relative", "protocol": None, "host": candidate[2:].split("/")[0],
+                "pathname": "/" + "/".join(candidate[2:].split("/")[1:]), "query": "", "full": candidate}
+    if candidate.startswith("/"):
         return {"kind": "relative-path", "protocol": None, "host": None,
                 "pathname": candidate.split("?")[0], "query": "", "full": candidate}
     parts = candidate.split("/")
-    if NOISE_SEGMENT_RE.match(candidate):
-        return None
     if len(parts) >= 2 and not candidate.startswith((".", "#", "\\")):
         return {"kind": "relative-segment", "protocol": None, "host": None,
                 "pathname": candidate, "query": "", "full": candidate}
     return None
 
 
-def parametrize_template(template):
-    return re.sub(r"\$\{[^}]*\}", "{param}", template)
+def _fold_concat(sig, idx):
+    """If sig[idx] (string/template) is part of a '+' chain, fold the whole
+    chain into one URL pattern. Returns (text, had_string, end_index)."""
+    # expand left to the chain start
+    start = idx
+    while start - 2 >= 0 and sig[start - 1].type == "punct" and sig[start - 1].value == "+" \
+            and sig[start - 2].type in ("string", "template", "name", "number"):
+        # only keep simple operands on the left
+        start -= 2
+    # collect operands left..right joined by '+'
+    text = []
+    had_string = False
+    j = start
+    end = idx
+    while j < len(sig):
+        t = sig[j]
+        if t.type in ("string", "template"):
+            frag, is_str = _operand_text(t)
+            text.append(frag)
+            had_string = had_string or is_str
+            end = j
+        elif t.type in ("name", "number"):
+            # member chain operand -> {param}
+            _, e = chain_forward(sig, j) if t.type == "name" else ([], j)
+            text.append("{param}")
+            j = e
+            end = j
+        else:
+            break
+        # expect '+' to continue
+        if j + 1 < len(sig) and sig[j + 1].type == "punct" and sig[j + 1].value == "+":
+            j += 2
+            continue
+        break
+    return "".join(text), had_string, end
 
 
-def looks_like_path_or_url(candidate):
-    if not candidate:
-        return False
-    if "/" not in candidate and not candidate.lower().startswith("http"):
-        return False
-    if re.match(r"^\d+(\.\d+)?$", candidate):
-        return False
-    return True
-
-
-def extract_endpoints(source):
+def extract_endpoints(source, tokens=None):
+    sig = significant(tokens if tokens is not None else tokenize(source))
     findings = []
     seen = set()
 
@@ -203,7 +641,7 @@ def extract_endpoints(source):
         classified = classify_candidate(candidate)
         if not classified:
             return
-        key = classified["full"]
+        key = context + "|" + classified["full"]
         if key in seen:
             return
         seen.add(key)
@@ -216,45 +654,69 @@ def extract_endpoints(source):
             "line": line,
         })
 
-    # Template literals first, so `${...}` paths survive.
-    for m in TEMPLATE_URL_RE.finditer(source):
-        pattern = parametrize_template(m.group(1))
-        record(pattern, line_number_of_index(source, m.start(1)), "template-literal")
-
-    # HTTP call arguments.
-    for m in HTTP_CALL_RE.finditer(source):
-        candidate = parametrize_template(m.group(2))
-        record(candidate, line_number_of_index(source, m.start(2)), "http-call")
-
-    # Generic string literals that look like paths/URLs.
-    for m in STRING_URL_RE.finditer(source):
-        candidate = parametrize_template(m.group(1))
-        record(candidate, line_number_of_index(source, m.start(1)), "string-literal")
-
+    consumed = set()
+    for i, t in enumerate(sig):
+        if i in consumed:
+            continue
+        # HTTP call: name(  ...
+        if t.type == "name" and t.value in HTTP_CALL_NAMES:
+            if i + 1 < len(sig) and sig[i + 1].type == "punct" and sig[i + 1].value == "(":
+                k = i + 2
+                if k < len(sig) and sig[k].type in ("string", "template"):
+                    text, _, end = _fold_concat(sig, k)
+                    for x in range(k, end + 1):
+                        consumed.add(x)
+                    record(text, sig[k].line, "http-call:" + t.value)
+                    continue
+        if t.type in ("string", "template"):
+            text, had_string, end = _fold_concat(sig, i)
+            for x in range(i, end + 1):
+                consumed.add(x)
+            if had_string:
+                ctx = "concat" if end > i else ("template-literal" if t.type == "template" else "string-literal")
+                record(text, t.line, ctx)
     return findings
 
 
-def line_number_of_index(source, index):
-    if index is None or index < 0:
-        return 1
-    return source.count("\n", 0, min(index, len(source))) + 1
+# ---------------------------------------------------------------------------
+# Secret scanning
+# ---------------------------------------------------------------------------
 
+SENSITIVE_NAME_HINTS = [
+    "apikey", "api_key", "secret", "token", "password", "passwd", "pwd",
+    "authorization", "auth_token", "authtoken", "accesskey", "access_key",
+    "privatekey", "private_key", "clientsecret", "client_secret", "sessionid",
+    "session_id", "credential", "bearer",
+]
 
-def redact_value(value):
-    if not value:
-        return ""
-    if len(value) <= 8:
-        return "*" * len(value)
-    return value[:4] + "*" * max(4, len(value) - 8) + value[-4:]
+KNOWN_PREFIX_RULES = [
+    ("AWS Access Key ID", ("AKIA", "ASIA"), 20, 20),
+    ("Google API Key", ("AIza",), 39, 39),
+    ("GitHub Token", ("ghp_", "gho_", "ghu_", "ghs_", "ghr_", "github_pat_"), 20, 255),
+    ("Slack Token", ("xoxb-", "xoxp-", "xoxa-", "xoxr-", "xoxs-"), 20, 200),
+    ("Stripe Key", ("sk_live_", "pk_live_", "rk_live_"), 15, 200),
+    ("Stripe Test Key", ("sk_test_", "rk_test_", "pk_test_"), 15, 200),
+    ("Anthropic API Key", ("sk-ant-",), 20, 200),
+    ("OpenAI API Key", ("sk-",), 20, 200),
+]
+
+_BASE64 = set("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/=_-")
 
 
 def base64_like(value):
     if not value:
         return False
     for ch in value:
-        if ch not in BASE64_CHARS:
+        if ch not in _BASE64:
             return False
     return True
+
+
+def _b64decode(seg):
+    import base64
+    s = str(seg).replace("-", "+").replace("_", "/")
+    s += "=" * (-len(s) % 4)
+    return base64.b64decode(s)
 
 
 def detect_jwt(value):
@@ -263,12 +725,9 @@ def detect_jwt(value):
         return None
     if any(len(p) < 4 or not base64_like(p) for p in parts):
         return None
-    # Require a real JWT header ({"alg":..} / {"typ":..}) so dotted
-    # hostnames and property chains are not reported as tokens.
     try:
-        head = str(parts[0]).replace("-", "+").replace("_", "/")
-        head += "=" * (-len(head) % 4)
-        header = json.loads(base64.b64decode(head))
+        import json
+        header = json.loads(_b64decode(parts[0]))
         if isinstance(header, dict) and ("alg" in header or "typ" in header):
             return "JWT"
     except Exception:
@@ -284,7 +743,32 @@ def detect_pem(value):
     return None
 
 
-def scan_secrets(source):
+def _name_sensitive(name):
+    if not name:
+        return None
+    low = name.lower()
+    for hint in SENSITIVE_NAME_HINTS:
+        if hint in low:
+            return hint
+    return None
+
+
+def _known_prefix(value):
+    for label, prefixes, lo, hi in KNOWN_PREFIX_RULES:
+        for p in prefixes:
+            if value.startswith(p) and lo <= len(value) <= hi:
+                if label == "OpenAI API Key":
+                    if value.startswith("sk-ant-"):
+                        continue
+                    if not (re.search(r"\d", value) and re.search(r"[A-Z]", value)
+                            and re.search(r"[a-z]", value) and entropy(value) >= 3.8):
+                        continue
+                return label
+    return None
+
+
+def scan_secrets(source, tokens=None):
+    sig = significant(tokens if tokens is not None else tokenize(source))
     findings = []
     seen = set()
 
@@ -302,311 +786,434 @@ def scan_secrets(source):
             "reason": reason,
         })
 
-    # Known prefixes
-    for label, prefixes, min_len, max_len in KNOWN_PREFIX_RULES:
-        for prefix in prefixes:
-            tail_min = max(0, min_len - len(prefix))
-            tail_max = max(tail_min, max_len - len(prefix))
-            pattern = re.escape(prefix) + r"[A-Za-z0-9_\-]{%d,%d}" % (tail_min, tail_max)
-            for m in re.finditer(pattern, source):
-                value = m.group(0)
-                if label == "OpenAI API Key":
-                    if value.startswith("sk-ant-"):
-                        continue
-                    # "sk-" alone matches CSS classes (sk-skeleton-...); real
-                    # keys are long, contain digits and mixed case.
-                    if not (re.search(r"\d", value) and re.search(r"[A-Z]", value)
-                            and re.search(r"[a-z]", value) and entropy(value) >= 3.8):
-                        continue
-                # Keys embedded mid-word (e.g. "EURASIA...") are not keys.
-                if m.start() > 0 and re.match(r"[A-Za-z0-9_]", source[m.start() - 1]):
-                    continue
-                record(label, value, line_number_of_index(source, m.start()), "known-prefix")
-
-    # PEM / JWT
-    for m in re.finditer(r"-----BEGIN [A-Z ]+-----[^-]+-----END [A-Z ]+-----", source):
-        label = detect_pem(m.group(0))
-        if label:
-            record(label, m.group(0), line_number_of_index(source, m.start()), "pem-block")
-
-    for m in re.finditer(r"\b[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\b", source):
-        value = m.group(0)
-        label = detect_jwt(value)
-        if label:
-            record(label, value, line_number_of_index(source, m.start()), "jwt-structure")
-
-    # Sensitive-name assignments / properties.
-    for m in ASSIGN_VALUE_RE.finditer(source):
-        value = m.group(1)
-        record("Sensitive-Named Value", value, line_number_of_index(source, m.start()), "sensitive-name")
-
-    # High-entropy literals (best-effort, strings only).
-    for m in re.finditer(r"""['"]([^'"\s]{24,4096})['"]""", source):
-        value = m.group(1)
-        if not base64_like(value):
+    for i, t in enumerate(sig):
+        # Sensitive-named assignment / property: name (= | :) "string"
+        if t.type == "name":
+            hint = _name_sensitive(t.value)
+            if hint and i + 2 < len(sig):
+                op = sig[i + 1]
+                val = sig[i + 2]
+                if op.type == "punct" and op.value in ("=", ":") and val.type == "string" and len(val.value) >= 6:
+                    record("Sensitive-Named Value", val.value, val.line, "name:" + t.value)
+        if t.type != "string":
             continue
-        if value == value.upper() and re.search(r"[A-Z]", value):
+        v = t.value
+        if len(v) < 8:
             continue
-        e = entropy(value)
-        if e >= 4.2:
-            record("High-Entropy String", value, line_number_of_index(source, m.start()), "entropy")
-
+        known = _known_prefix(v)
+        if known:
+            record(known, v, t.line, "known-prefix")
+            continue
+        pem = detect_pem(v)
+        if pem:
+            record(pem, v, t.line, "pem-block")
+            continue
+        jwt = detect_jwt(v)
+        if jwt:
+            record(jwt, v, t.line, "jwt-structure")
+            continue
+        if 24 <= len(v) <= 4096 and " " not in v and base64_like(v):
+            if not (v == v.upper() and re.search(r"[A-Z]", v)):
+                e = entropy(v)
+                if e >= 4.2:
+                    record("High-Entropy String", v, t.line, "entropy:%.2f" % e)
     return findings
 
 
-def contains_taint(fragment):
-    lowered = fragment.lower()
-    return any(token in lowered for token in TAINT_SOURCE_TOKENS)
+# ---------------------------------------------------------------------------
+# DOM XSS
+# ---------------------------------------------------------------------------
 
-
-def _var_ref_re(name):
-    # \b does not work for identifiers containing "$" (e.g. $el), so use
-    # explicit identifier-boundary lookarounds.
-    return re.compile(r"(?<![\w$.])" + re.escape(name) + r"(?![\w$])")
-
-
-def _statement_window(source, start, limit=400, stop_at_close=False):
-    """Text from `start` to the end of the current expression/statement:
-    stops at ; , or newline at nesting depth 0 (or at the closing paren of a
-    call when stop_at_close). Keeps minified one-line bundles from treating
-    the rest of the whole file as the sink argument."""
-    depth = 0
-    end = start
-    n = min(len(source), start + limit)
-    quote = None
-    while end < n:
-        ch = source[end]
-        if quote:
-            if ch == "\\":
-                end += 2
-                continue
-            if ch == quote:
-                quote = None
-        elif ch in "'\"`":
-            quote = ch
-        elif ch in "([{":
-            depth += 1
-        elif ch in ")]}":
-            if depth == 0:
-                break
-            depth -= 1
-        elif depth == 0 and ch in ";,\n":
-            break
-        end += 1
-    return source[start:end]
-
-
-def _is_commented(source, index):
-    line_start = source.rfind("\n", 0, index) + 1
-    prefix = source[line_start:index].lstrip()
-    return prefix.startswith("//") or prefix.startswith("*") or prefix.startswith("/*")
-
-
-XSS_PROPERTY_SINK_RE = re.compile(
-    r"(?:\.\s*(innerHTML|outerHTML|srcdoc)|\[\s*['\"](innerHTML|outerHTML|srcdoc)['\"]\s*\])\s*=(?![=>])")
-XSS_LOCATION_ASSIGN_RE = re.compile(
-    r"(?<![\w$.])(?:(?:window|document|self|top|parent)\s*\.\s*)?location(?:\s*\.\s*href)?\s*=(?![=>])")
-XSS_CALL_SINKS = [
-    (re.compile(r"\.\s*insertAdjacentHTML\s*\("), "insertAdjacentHTML", False),
-    (re.compile(r"\bdocument\s*\.\s*write\s*\("), "write", False),
-    (re.compile(r"\bdocument\s*\.\s*writeln\s*\("), "writeln", False),
-    (re.compile(r"(?<![\w$.])eval\s*\("), "eval", False),
-    (re.compile(r"\bnew\s+Function\s*\("), "Function-constructor", False),
-    (re.compile(r"(?<![\w$.])(?<!new )(?<!new\t)Function\s*\("), "Function-constructor", False),
-    (re.compile(r"\blocation\s*\.\s*assign\s*\("), "location.assign", False),
-    (re.compile(r"\blocation\s*\.\s*replace\s*\("), "location.replace", False),
-    # jQuery HTML sinks are extremely common with static strings; only report
-    # them when the argument looks attacker-controlled.
-    (re.compile(r"\.\s*(?:html|append|prepend|after|before|replaceWith|wrap|wrapAll)\s*\("), "jquery-html", True),
-    (re.compile(r"(?<![\w$.])(?:\$|jQuery)\s*\("), "jquery-selector", True),
+SOURCE_TOKENS = [
+    "location.search", "location.hash", "location.href", "location.pathname",
+    "location.search", "document.referrer", "document.url", "document.documenturi",
+    "window.name", "urlsearchparams", "localstorage", "sessionstorage",
+    "document.cookie", "location",
 ]
-XSS_TIMER_RE = re.compile(r"\b(setTimeout|setInterval)\s*\(")
-XSS_MESSAGE_LISTENER_RE = re.compile(r"""addEventListener\s*\(\s*['"]message['"]|\bonmessage\s*=(?!=)""")
-TAINT_ASSIGN_RE = re.compile(r"(?<![\w$.])([A-Za-z_$][\w$]*)\s*=(?![=>])\s*([^;\n]{1,600})")
+HTML_PROP_SINKS = set(["innerHTML", "outerHTML", "srcdoc"])
+URL_PROP_SINKS = set(["src", "href", "action", "formaction", "data"])
+JQUERY_HTML = set(["html", "append", "prepend", "after", "before", "replaceWith", "wrap", "wrapAll"])
 
 
-def analyze_dom_xss(source):
-    findings = []
+def _chain_has_source(tokens_slice):
+    """True if the token slice reads a known client-controllable source."""
+    low = slice_text(tokens_slice).lower().replace(" . ", ".").replace(" .", ".").replace(". ", ".")
+    for tok_ in SOURCE_TOKENS:
+        if tok_ in low:
+            # avoid "location" matching inside a longer identifier like "relocation"
+            if tok_ == "location":
+                import re as _re
+                if _re.search(r"(?<![a-z0-9_$])location(?![a-z0-9_$])", low):
+                    return True
+            else:
+                return True
+    return False
 
-    # Collect tainted variable names, bounded fixed point.
-    assignments = []
-    for m in TAINT_ASSIGN_RE.finditer(source):
-        name = m.group(1)
-        value = _statement_window(source, m.start(2), 600)
-        if re.match(r"^(?:function|class|new\s+Function\b)", value):
-            continue
-        assignments.append((name, value))
 
-    tainted_vars = set()
-    var_res = {}
+def _collect_tainted(sig):
+    """Variable names whose value derives from a source, bounded fixed point."""
+    assigns = []  # (name, value_tokens)
+    for i, t in enumerate(sig):
+        if t.type == "name" and i + 1 < len(sig) and sig[i + 1].type == "punct" and sig[i + 1].value == "=" \
+                and not (i + 1 < len(sig) and sig[i + 1].value in ("==", "===")):
+            # not a comparison and not => (tokenizer gives those as single tokens)
+            prev = sig[i - 1] if i > 0 else None
+            if prev is not None and prev.type == "punct" and prev.value in (".", "?."):
+                continue  # member assignment, handled as sink
+            val, _ = statement_slice(sig, i + 2)
+            assigns.append((t.value, val))
+        elif t.type == "name" and t.value in ("var", "let", "const") and i + 3 < len(sig) \
+                and sig[i + 1].type == "name" and sig[i + 2].type == "punct" and sig[i + 2].value == "=":
+            val, _ = statement_slice(sig, i + 3)
+            assigns.append((sig[i + 1].value, val))
+
+    tainted = set()
+    name_set = set(n for n, _ in assigns)
     for _ in range(6):
         changed = False
-        for name, value in assignments:
-            if name in tainted_vars:
+        for name, val in assigns:
+            if name in tainted:
                 continue
-            if contains_taint(value) or any(var_res[v].search(value) for v in tainted_vars):
-                tainted_vars.add(name)
-                var_res[name] = _var_ref_re(name)
+            if _chain_has_source(val):
+                tainted.add(name)
                 changed = True
+                continue
+            for v in val:
+                if v.type == "name" and v.value in tainted:
+                    tainted.add(name)
+                    changed = True
+                    break
         if not changed:
             break
+    return tainted
 
-    def is_tainted(text):
-        return contains_taint(text) or any(var_res[v].search(text) for v in tainted_vars)
 
-    def add(sink, target, index, argtext, tainted, severity=None):
+def _slice_tainted(tokens_slice, tainted):
+    if _chain_has_source(tokens_slice):
+        return True
+    for t in tokens_slice:
+        if t.type == "name" and t.value in tainted:
+            return True
+        if t.type == "name" and "." in slice_text([t]):
+            pass
+    # var.data style
+    txt = slice_text(tokens_slice)
+    if ".data" in txt.replace(" ", ""):
+        return True
+    return False
+
+
+def analyze_dom_xss(source, tokens=None):
+    sig = significant(tokens if tokens is not None else tokenize(source))
+    findings = []
+    seen = set()
+    tainted = _collect_tainted(sig)
+
+    def add(sink, target, line, start_idx, arg_tokens, is_tainted, severity=None):
         if severity is None:
-            if tainted:
+            if is_tainted:
                 severity = "HIGH"
             elif sink in ("eval", "Function-constructor"):
                 severity = "MEDIUM"
             else:
                 severity = "LOW"
-        line_no = line_number_of_index(source, index)
-        snippet = source[max(0, index - 60):index + 240].replace("\n", " ").strip()
+        key = (sink, line, start_idx)
+        if key in seen:
+            return
+        seen.add(key)
+        snippet = slice_text(sig[max(0, start_idx - 3):start_idx + 14])[:300]
         findings.append({
             "sinkType": sink,
             "target": target,
-            "line": line_no,
-            "index": index,
-            "snippet": snippet[:300],
-            "argument": argtext[:300],
-            "taintedBySource": bool(tainted),
+            "line": line,
+            "snippet": snippet,
+            "taintedBySource": bool(is_tainted),
             "severity": severity,
         })
 
-    for m in XSS_PROPERTY_SINK_RE.finditer(source):
-        if _is_commented(source, m.start()):
-            continue
-        prop = m.group(1) or m.group(2)
-        right = _statement_window(source, m.end())
-        add(prop, prop, m.start(), right, is_tainted(right))
+    n = len(sig)
+    for i in range(n):
+        t = sig[i]
 
-    for m in XSS_LOCATION_ASSIGN_RE.finditer(source):
-        if _is_commented(source, m.start()):
-            continue
-        right = _statement_window(source, m.end())
-        tainted = is_tainted(right)
-        add("location-assign", "location", m.start(), right, tainted,
-            "HIGH" if tainted else "INFO")
+        # Property sinks: .innerHTML = / ['innerHTML'] = / .src = ...
+        if t.type == "punct" and t.value == "=" and i + 1 < n:
+            # left side: previous token is a name (prop) or a string in [ ]
+            prop = None
+            obj_end = i - 1
+            if i >= 1 and sig[i - 1].type == "name":
+                prop = sig[i - 1].value
+                obj_end = i - 1
+            elif i >= 2 and sig[i - 1].type == "punct" and sig[i - 1].value == "]" and sig[i - 2].type == "string":
+                prop = sig[i - 2].value
+            if prop:
+                chain = None
+                if i >= 2 and sig[i - 2].type == "punct" and sig[i - 2].value in (".", "?."):
+                    parts, _ = chain_backward(sig, obj_end)
+                    chain = ".".join(parts)
+                if prop in HTML_PROP_SINKS:
+                    rhs, _ = statement_slice(sig, i + 1)
+                    add(prop, chain or prop, t.line, i + 1, rhs, _slice_tainted(rhs, tainted))
+                    continue
+                if prop in URL_PROP_SINKS and chain:
+                    rhs, _ = statement_slice(sig, i + 1)
+                    tt = _slice_tainted(rhs, tainted)
+                    # javascript: URLs or tainted navigations
+                    if tt:
+                        add(prop + "-assign", chain, t.line, i + 1, rhs, True, "HIGH")
+                    continue
+                # location = ... / window.location = ...
+                if (prop == "location" or (chain and chain.lower().endswith("location"))):
+                    rhs, _ = statement_slice(sig, i + 1)
+                    tt = _slice_tainted(rhs, tainted)
+                    add("location-assign", chain or "location", t.line, i + 1, rhs, tt,
+                        "HIGH" if tt else "INFO")
+                    continue
 
-    for regex, sink, only_if_tainted in XSS_CALL_SINKS:
-        for m in regex.finditer(source):
-            if _is_commented(source, m.start()):
+        if t.type != "name":
+            continue
+        nxt = sig[i + 1] if i + 1 < n else None
+        is_call = nxt is not None and nxt.type == "punct" and nxt.value == "("
+        dotted = i >= 1 and sig[i - 1].type == "punct" and sig[i - 1].value in (".", "?.")
+
+        if is_call:
+            args, _ = statement_slice(sig, i + 2)
+            tt = _slice_tainted(args, tainted)
+
+            if t.value == "eval" and not dotted:
+                add("eval", "eval()", t.line, i, args, tt)
                 continue
-            arg = _statement_window(source, m.end(), 400, stop_at_close=True)
-            tainted = is_tainted(arg)
-            if only_if_tainted and not tainted:
+            if t.value in ("setTimeout", "setInterval") and args:
+                first_depth0 = []
+                depth = 0
+                for a in args:
+                    if a.type == "punct" and a.value in ("(", "[", "{"):
+                        depth += 1
+                    elif a.type == "punct" and a.value in (")", "]", "}"):
+                        depth -= 1
+                    elif a.type == "punct" and a.value == "," and depth == 0:
+                        break
+                    first_depth0.append(a)
+                if first_depth0 and first_depth0[0].type == "string":
+                    add(t.value + "-string-arg", t.value, t.line, i, first_depth0,
+                        _slice_tainted(first_depth0, tainted), "MEDIUM")
+                elif first_depth0 and first_depth0[0].type not in ("name",) and _slice_tainted(first_depth0, tainted):
+                    add(t.value + "-string-arg", t.value, t.line, i, first_depth0, True, "HIGH")
+                elif first_depth0 and first_depth0[0].type == "name" and first_depth0[0].value in tainted \
+                        and not (len(first_depth0) > 1 and first_depth0[1].value in ("=>",)):
+                    add(t.value + "-string-arg", t.value, t.line, i, first_depth0, True, "HIGH")
                 continue
-            add(sink, sink, m.start(), arg, tainted)
-
-    for m in XSS_TIMER_RE.finditer(source):
-        if _is_commented(source, m.start()):
-            continue
-        # The window stops at the first depth-0 comma, i.e. it is the first
-        # argument only.
-        first = _statement_window(source, m.end(), 400).strip()
-        sink = m.group(1) + "-string-arg"
-        if first[:1] in ("'", '"', "`"):
-            add(sink, m.group(1), m.start(), first, is_tainted(first), "MEDIUM")
-        elif not re.match(r"(?:async\s+)?(?:function\b|\(?[\w$,\s]*\)?\s*=>)", first) and is_tainted(first):
-            add(sink, m.group(1), m.start(), first, True, "HIGH")
-
-    for m in XSS_MESSAGE_LISTENER_RE.finditer(source):
-        if _is_commented(source, m.start()):
-            continue
-        body = source[m.start():m.start() + 1500]
-        has_origin_check = re.search(r"\.origin\b", body) is not None
-        # Find the handler's event parameter (function(ev){..} / ev => ..) and
-        # check whether ev.data reaches an HTML/JS sink inside the handler.
-        pm = re.search(r"function\s*[\w$]*\s*\(\s*([\w$]+)|\(?\s*([\w$]+)\s*\)?\s*=>", body)
-        param = (pm.group(1) or pm.group(2)) if pm else None
-        data_to_sink = False
-        if param:
-            data_re = re.escape(param) + r"\s*\.\s*data\b"
-            data_to_sink = re.search(
-                r"(?:innerHTML|outerHTML|srcdoc|insertAdjacentHTML|document\.write|eval|Function|\.html|location)"
-                r"[^;]{0,200}" + data_re, body) is not None
-        if data_to_sink:
-            severity = "MEDIUM" if has_origin_check else "HIGH"
+            if t.value == "Function":
+                is_new = i >= 1 and sig[i - 1].type == "name" and sig[i - 1].value == "new"
+                if is_new or not dotted:
+                    add("Function-constructor", "new Function()", t.line, i, args, tt)
+                    continue
+            if dotted and t.value in ("write", "writeln"):
+                parts, _ = chain_backward(sig, i - 2) if i >= 2 else ([], i)
+                chain = ".".join(parts).lower()
+                # Only document.write / doc.write -- not stream.write, res.write.
+                if "document" in chain or chain in ("doc", "d"):
+                    add(t.value, ".".join(parts) or t.value, t.line, i, args, tt)
+                continue
+            if dotted and t.value in ("insertAdjacentHTML", "setHTML"):
+                add(t.value, t.value, t.line, i, args, tt)
+                continue
+            if dotted and t.value in JQUERY_HTML and tt:
+                add("jquery-html", t.value, t.line, i, args, True, "HIGH")
+                continue
+            if t.value in ("$", "jQuery") and not dotted and tt:
+                add("jquery-selector", t.value, t.line, i, args, True, "HIGH")
+                continue
+            if dotted and t.value in ("assign", "replace"):
+                parts, _ = chain_backward(sig, i - 2) if i >= 2 else ([], i)
+                if ".".join(parts).lower().endswith("location"):
+                    add("location." + t.value, "location", t.line, i, args, tt,
+                        "HIGH" if tt else "LOW")
+                    continue
+            if t.value == "addEventListener" and args and args[0].type == "string" and args[0].value == "message":
+                body, _ = statement_slice(sig, i + 2)
+                _add_message_listener(add, sig, i, body)
+                continue
         else:
-            severity = "LOW" if has_origin_check else "MEDIUM"
-        add("message-listener", "postMessage handler", m.start(), body[:300], data_to_sink, severity)
+            # onmessage = handler
+            if t.value == "onmessage" and nxt is not None and nxt.type == "punct" and nxt.value == "=":
+                body, _ = statement_slice(sig, i + 2)
+                _add_message_listener(add, sig, i, body)
+                continue
 
-    # Deduplicate by (sink, position) -- NOT by line, so every sink in a
-    # minified single-line bundle is reported.
-    deduped = []
+    findings.sort(key=lambda f: (f["line"], f["sinkType"]))
+    return findings
+
+
+def _add_message_listener(add, sig, i, body_tokens):
+    low = slice_text(body_tokens).lower()
+    has_origin = ".origin" in low.replace(" ", "")
+    # find event param name: function(ev) or (ev)=> or ev=>
+    param = None
+    for k, t in enumerate(body_tokens):
+        if t.type == "name" and t.value == "function":
+            # function ( PARAM
+            for m in range(k + 1, min(k + 4, len(body_tokens))):
+                if body_tokens[m].type == "name":
+                    param = body_tokens[m].value
+                    break
+            break
+    if param is None:
+        # arrow: NAME =>  or ( NAME ) =>
+        for k, t in enumerate(body_tokens):
+            if t.type == "punct" and t.value == "=>":
+                # look back for a name
+                j = k - 1
+                while j >= 0 and body_tokens[j].type == "punct" and body_tokens[j].value in (")",):
+                    j -= 1
+                if j >= 0 and body_tokens[j].type == "name":
+                    param = body_tokens[j].value
+                break
+    data_to_sink = False
+    if param:
+        txt = slice_text(body_tokens).replace(" ", "")
+        if (param + ".data") in txt and any(s in txt for s in (
+                "innerHTML", "outerHTML", "srcdoc", "insertAdjacentHTML",
+                "document.write", "eval(", "Function(", ".html(", "location")):
+            data_to_sink = True
+    if data_to_sink:
+        sev = "MEDIUM" if has_origin else "HIGH"
+    else:
+        sev = "LOW" if has_origin else "MEDIUM"
+    add("message-listener", "postMessage handler", sig[i].line, i, body_tokens, data_to_sink, sev)
+
+
+# ---------------------------------------------------------------------------
+# Sensitive functions (information gathering)
+# ---------------------------------------------------------------------------
+
+SENSITIVE_FUNC_HINTS = [
+    "auth", "login", "logout", "token", "password", "passwd", "secret", "cred",
+    "admin", "pay", "payment", "checkout", "card", "crypt", "encrypt", "decrypt",
+    "sign", "session", "csrf", "nonce", "debug", "eval", "exec", "upload",
+    "download", "redirect", "sanitiz", "escape", "render", "template", "key",
+    "jwt", "oauth", "sso", "permission", "role", "privileg",
+]
+
+
+def extract_functions(source, tokens=None):
+    sig = significant(tokens if tokens is not None else tokenize(source))
+    found = []
     seen = set()
-    for f in sorted(findings, key=lambda x: x["index"]):
-        key = (f["sinkType"], f["index"])
-        if key not in seen:
-            seen.add(key)
-            deduped.append(f)
-    return deduped
+
+    def add(name, line):
+        hint = None
+        low = name.lower()
+        for h in SENSITIVE_FUNC_HINTS:
+            if h in low:
+                hint = h
+                break
+        if not hint:
+            return
+        key = name + "|" + str(line)
+        if key in seen:
+            return
+        seen.add(key)
+        found.append({"name": name, "line": line, "why": "name~" + hint})
+
+    n = len(sig)
+    for i in range(n):
+        t = sig[i]
+        if t.type == "name" and t.value == "function" and i + 1 < n and sig[i + 1].type == "name":
+            add(sig[i + 1].value, sig[i + 1].line)
+        # NAME = function / NAME = ( ... ) =>  / NAME : function
+        if t.type == "name" and i + 1 < n and sig[i + 1].type == "punct" and sig[i + 1].value in ("=", ":"):
+            if i + 2 < n and sig[i + 2].type == "name" and sig[i + 2].value == "function":
+                add(t.value, t.line)
+            else:
+                # arrow within a few tokens
+                for k in range(i + 2, min(i + 8, n)):
+                    if sig[k].type == "punct" and sig[k].value == "=>":
+                        add(t.value, t.line)
+                        break
+                    if sig[k].type == "punct" and sig[k].value in (";", ",", "{"):
+                        break
+    return found
+
+
+# ---------------------------------------------------------------------------
+# Frameworks + summary + top-level
+# ---------------------------------------------------------------------------
+
+FRAMEWORK_SIGNATURES = [
+    ("React", ["React.createElement", "react-dom", "_jsx", "__REACT_DEVTOOLS"]),
+    ("Vue", ["Vue.component", "createApp", "__VUE__", "vue-router"]),
+    ("Angular", ["angular.module", "ng-app", "@angular/core"]),
+    ("jQuery", ["jQuery.fn.jquery", "jQuery(", "$.ajax"]),
+    ("Webpack bundle", ["__webpack_require__", "webpackJsonp"]),
+    ("Next.js", ["__NEXT_DATA__", "next/router"]),
+]
 
 
 def detect_frameworks(source):
     detected = []
-    for name, tokens in FRAMEWORK_SIGNATURES:
-        for token in tokens:
-            if token in source:
+    for name, tokens_ in FRAMEWORK_SIGNATURES:
+        for tk in tokens_:
+            if tk in source:
                 detected.append(name)
                 break
     return detected
 
 
-def build_summary(source, meta, endpoints, secrets, xss):
+def build_summary(source, meta, endpoints, secrets, xss, functions):
     lines = source.count("\n") + 1
     frameworks = detect_frameworks(source)
     url = meta.get("url", "This file")
-    sentences = []
-    sentences.append("%s is a JavaScript resource of %d lines." % (url, lines))
+    out = ["%s is a JavaScript resource of %d lines (beautified)." % (url, lines)]
     if frameworks:
-        sentences.append("It appears to use: %s." % ", ".join(frameworks))
+        out.append("It appears to use: %s." % ", ".join(frameworks))
     else:
-        sentences.append("No recognized frontend framework signature was detected; it may be a plain script, utility bundle, or custom code.")
+        out.append("No recognized frontend framework signature was detected.")
     if endpoints:
-        sentences.append("Static analysis found %d candidate URL/endpoint string(s) referenced in this file." % len(endpoints))
+        out.append("Found %d candidate URL/endpoint(s)." % len(endpoints))
+    if functions:
+        out.append("Flagged %d sensitive-looking function(s) for review." % len(functions))
     if secrets:
-        sentences.append("WARNING: %d string(s) matched secret/credential heuristics and should be manually verified." % len(secrets))
+        out.append("WARNING: %d string(s) matched secret/credential heuristics; verify manually." % len(secrets))
     if xss:
         high = len([f for f in xss if f.get("severity") == "HIGH"])
-        sentences.append("%d potential DOM XSS sink(s) were identified, of which %d appear tainted by a client-controllable source and are flagged HIGH severity." % (len(xss), high))
+        out.append("%d DOM XSS sink(s) identified, %d flagged HIGH (tainted by a client-controllable source)." % (len(xss), high))
     else:
-        sentences.append("No DOM XSS sink patterns were identified by static analysis in this file.")
-    return " ".join(sentences)
+        out.append("No DOM XSS sink patterns identified by static analysis.")
+    return " ".join(out)
 
 
 def analyze_js_source(source, meta):
-    endpoints = extract_endpoints(source)
-    secrets = scan_secrets(source)
-    xss = analyze_dom_xss(source)
-    frameworks = detect_frameworks(source)
-    summary = build_summary(source, meta, endpoints, secrets, xss)
+    beautified = beautify(source)
+    tokens = tokenize(beautified)
+    endpoints = extract_endpoints(beautified, tokens)
+    secrets = scan_secrets(beautified, tokens)
+    xss = analyze_dom_xss(beautified, tokens)
+    functions = extract_functions(beautified, tokens)
+    frameworks = detect_frameworks(beautified)
+    summary = build_summary(beautified, meta, endpoints, secrets, xss, functions)
     return {
         "endpoints": endpoints,
         "secrets": secrets,
         "xss": xss,
+        "functions": functions,
         "frameworks": frameworks,
         "summary": summary,
-        "lineCount": lines_of(source),
-        # The Files table and detail pane read item["lines"]; it was missing,
-        # which raised KeyError on every repaint of the JS Files tab.
-        "lines": lines_of(source),
+        "lineCount": lines_of(beautified),
+        "lines": lines_of(beautified),
+        "source": beautified,
     }
 
 
-def lines_of(source):
-    return source.count("\n") + 1
-
-
 def payload_for_finding(finding):
+    import time
     sink = finding.get("sinkType", "")
     marker = "JSRECON-%d" % int(time.time() * 1000)
     templates = {
         "innerHTML": '<img src=x onerror="console.warn(\'%s\');alert(\'%s\')">' % (marker, marker),
         "outerHTML": '<img src=x onerror="console.warn(\'%s\');alert(\'%s\')">' % (marker, marker),
+        "srcdoc": '<script>console.warn(\'%s\');alert(\'%s\')<\/script>' % (marker, marker),
         "insertAdjacentHTML": '<svg onload="console.warn(\'%s\');alert(\'%s\')">' % (marker, marker),
+        "setHTML": '<img src=x onerror="alert(\'%s\')">' % marker,
         "write": "<script>console.warn('%s');alert('%s')<\/script>" % (marker, marker),
         "writeln": "<script>console.warn('%s');alert('%s')<\/script>" % (marker, marker),
         "eval": "alert('%s')" % marker,
@@ -616,10 +1223,11 @@ def payload_for_finding(finding):
         "location.assign": "javascript:alert('%s')" % marker,
         "location.replace": "javascript:alert('%s')" % marker,
         "location-assign": "javascript:alert('%s')" % marker,
-        "srcdoc": '<script>console.warn(\'%s\');alert(\'%s\')<\/script>' % (marker, marker),
+        "src-assign": "javascript:alert('%s')" % marker,
+        "href-assign": "javascript:alert('%s')" % marker,
         "jquery-html": '<img src=x onerror="console.warn(\'%s\');alert(\'%s\')">' % (marker, marker),
-        "jquery-selector": '<img src=x onerror="console.warn(\'%s\');alert(\'%s\')">' % (marker, marker),
-        "message-listener": "postMessage('<img src=x onerror=alert(\\'%s\\')>', '*')  // send from an attacker-controlled window/iframe" % marker,
+        "jquery-selector": '<img src=x onerror="alert(\'%s\')">' % marker,
+        "message-listener": "postMessage('<img src=x onerror=alert(\\'%s\\')>', '*')" % marker,
     }
     payload = templates.get(sink, '<img src=x onerror="alert(\'%s\')">' % marker)
     return marker, payload
@@ -935,8 +1543,9 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener, IContextMenuFactory, IExt
             self._store[item["id"]] = item
             self._by_url[url] = item
 
-        self._log("Analyzed %s (E:%d S:%d X:%d)" % (
-            url, len(item["endpoints"]), len(item["secrets"]), len(item["xss"])))
+        self._log("Analyzed %s (E:%d S:%d X:%d F:%d)" % (
+            url, len(item["endpoints"]), len(item["secrets"]), len(item["xss"]),
+            len(item.get("functions", []))))
         # Swing models must only be touched on the Event Dispatch Thread.
         self._on_edt(lambda: (self._append_item_rows(item), self._update_stats()))
 
@@ -1120,10 +1729,16 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener, IContextMenuFactory, IExt
             lines.append("  L%s  %s  (%s)" % (s["line"], s["redacted"], s["type"]))
         lines.append("")
         lines.append("DOM XSS findings: %d" % len(item["xss"]))
-        for x in item["xss"][:30]:
-            lines.append("  L%s  %s  %s" % (x["line"], x["severity"], x["sinkType"]))
+        for x in item["xss"][:40]:
+            tag = "tainted" if x.get("taintedBySource") else "not-tainted"
+            lines.append("  L%s  %-6s %-22s %s" % (x["line"], x["severity"], x["sinkType"], tag))
         lines.append("")
-        lines.append("Source preview (first 500 lines):")
+        funcs = item.get("functions", [])
+        lines.append("Sensitive functions: %d" % len(funcs))
+        for fdef in funcs[:40]:
+            lines.append("  L%s  %s  (%s)" % (fdef["line"], fdef["name"], fdef["why"]))
+        lines.append("")
+        lines.append("Source preview (first 500 lines, beautified):")
         preview = item["source"].split("\n")[:500]
         lines.extend(preview)
         return "\n".join(lines)
@@ -1313,6 +1928,9 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener, IContextMenuFactory, IExt
                     row = ["domxss", item["url"], x["line"], x["sinkType"], x["snippet"], x["severity"],
                            "tainted" if x["taintedBySource"] else "not-tainted"]
                     f.write(u",".join(_csv_cell(c) for c in row) + u"\r\n")
+                for fn in item.get("functions", []):
+                    row = ["function", item["url"], fn["line"], fn["name"], "", "", fn["why"]]
+                    f.write(u",".join(_csv_cell(c) for c in row) + u"\r\n")
 
     def _write_html_report(self, path):
         # Every value comes from the target's JavaScript, so it is HTML-escaped
@@ -1337,6 +1955,11 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener, IContextMenuFactory, IExt
                     rows.append(u"<li>L%d <b>%s</b> <code>%s</code> <i>%s</i><pre>%s</pre></li>" % (
                         x["line"], _esc(x["severity"]), _esc(x["sinkType"]),
                         "tainted" if x["taintedBySource"] else "not tainted", _esc(x["snippet"])))
+                rows.append(u"</ul>")
+            if item.get("functions"):
+                rows.append(u"<p><b>Sensitive functions</b></p><ul>")
+                for fn in item["functions"]:
+                    rows.append(u"<li>L%d <code>%s</code> <i>(%s)</i></li>" % (fn["line"], _esc(fn["name"]), _esc(fn["why"])))
                 rows.append(u"</ul>")
         html = u"<html><head><meta charset='utf-8'><title>JS Recon Report</title></head><body>"
         html += u"<h1>JS Recon Report</h1><p>Generated by JS Recon Burp extension.</p>"
