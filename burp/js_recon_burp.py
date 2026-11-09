@@ -51,7 +51,7 @@ import re
 import time
 
 
-VERSION = "1.1.0"
+VERSION = "1.1.1"
 AUTHZ_FILENAME = ".js_recon_authorization"
 
 
@@ -653,6 +653,17 @@ def _u(value):
         return str(value).decode("utf-8", "replace")
 
 
+def header_value(headers, name):
+    """Value of the first header called `name` (case-insensitive), or u"".
+    Burp's IExtensionHelpers has no getHeaderValue(), so parse it here."""
+    prefix = name.lower() + u":"
+    for raw in headers or []:
+        line = _u(raw)
+        if line.lower().startswith(prefix):
+            return line.split(u":", 1)[1].strip()
+    return u""
+
+
 def _esc(value):
     return cgi.escape(_u(value), quote=True)
 
@@ -808,20 +819,35 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener, IContextMenuFactory, IExt
         # Content-Type must come from the RESPONSE headers (the old code read
         # the request headers, so JS was only detected by URL extension).
         info = self._helpers.analyzeResponse(response)
-        headers = info.getHeaders()
-        content_type = (self._helpers.getHeaderValue(headers, "Content-Type") or "").lower()
-        url = unicode(message.getUrl())
+        content_type = header_value(info.getHeaders(), "Content-Type").lower()
+        java_url = self._url_of(message)
+        if java_url is None:
+            return
+        url = unicode(java_url)
         is_js_type = any(t in content_type for t in ("javascript", "ecmascript", "jscript"))
-        if not is_js_type and not self._looks_like_js_url(message.getUrl()):
+        if not is_js_type:
+            # Burp's own MIME sniffing ("script") catches JS served as text/plain etc.
+            try:
+                mimes = (_u(info.getStatedMimeType()) + u" " + _u(info.getInferredMimeType())).lower()
+                is_js_type = "script" in mimes
+            except Exception:
+                pass
+        if not is_js_type and not self._looks_like_js_url(java_url):
             return
-        if self._scope_only.isSelected() and not self._callbacks.isInScope(message.getUrl()):
+        if self._scope_only.isSelected() and not self._callbacks.isInScope(java_url):
             return
-        if self._host_filter.getText().strip():
-            allowed = str(self._host_filter.getText().strip()).lower()
-            host = str(message.getUrl().getHost()).lower()
-            if allowed not in host:
-                return
-        self._analyze_and_store(message, url)
+        allowed = _u(self._host_filter.getText()).strip().lower()
+        if allowed and allowed not in _u(java_url.getHost()).lower():
+            return
+        self._analyze_and_store(message, url, java_url)
+
+    def _url_of(self, message):
+        """java.net.URL for a message. IHttpRequestResponse has no getUrl() in
+        the Burp Extender API; the supported way is analyzeRequest(msg).getUrl()."""
+        try:
+            return self._helpers.analyzeRequest(message).getUrl()
+        except Exception:
+            return None
 
     def _looks_like_js_url(self, java_url):
         # Match on the path extension only, so .json / .jsp / ?x=.js are not
@@ -841,12 +867,16 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener, IContextMenuFactory, IExt
         for message in messages:
             if message and message.getResponse():
                 try:
-                    self._analyze_and_store(message, str(message.getUrl()))
+                    java_url = self._url_of(message)
+                    if java_url is None:
+                        self._log("Send-to-Recon: could not determine URL for a selected item.")
+                        continue
+                    self._analyze_and_store(message, unicode(java_url), java_url)
                 except Exception as e:
                     self._log("Send-to-Recon error: %s" % e)
 
     # -- Analysis ------------------------------------------------------------
-    def _analyze_and_store(self, message, url):
+    def _analyze_and_store(self, message, url, java_url):
         response = message.getResponse()
         try:
             # Analyze only the body, not the HTTP status line + headers.
@@ -869,7 +899,7 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener, IContextMenuFactory, IExt
         # Heavy analysis runs outside the lock (Burp calls us from many threads).
         item = {
             "url": url,
-            "host": unicode(message.getUrl().getHost()),
+            "host": _u(java_url.getHost()),
             "method": self._helpers.analyzeRequest(message).getMethod() if message.getRequest() else "",
             "ts": int(time.time() * 1000),
             "source": source,

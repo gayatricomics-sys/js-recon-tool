@@ -1,4 +1,4 @@
-JS Recon - Burp Suite extension (offline package)  v1.1.0
+JS Recon - Burp Suite extension (offline package)  v1.1.1
 =========================================================
 
 Everything needed is in this folder. No internet access is required.
@@ -21,7 +21,7 @@ INSTALL (offline)
    jython-standalone-2.7.4.jar from this folder.
 3. Extensions -> Installed -> Add -> Extension type: Python ->
    select js_recon_burp.py -> Next.
-4. The Output tab should show "[JS Recon] JS Recon 1.1.0 loaded." and the
+4. The Output tab should show "[JS Recon] JS Recon 1.1.1 loaded." and the
    Errors tab should be empty. A new "JS Recon" tab appears.
 
 USE
