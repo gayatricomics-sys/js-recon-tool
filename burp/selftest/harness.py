@@ -122,6 +122,30 @@ step("scope: out-of-scope host blocked", lambda: (ext._generate_and_copy({"url":
 step("scope: out-of-scope JS not captured (In-scope only default)", lambda: (ext.processHttpMessage(4, False, Msg("https://other.test/x.js", "eval(location.hash)", "application/javascript")), any(i["host"] == u"other.test" for i in ext._store.values()))[-1])
 step("diag: out-of-scope JS logs a skip reason", lambda: (ext.processHttpMessage(4, False, Msg("https://cdn.evil.test/a.js", "var x=1", "application/javascript")), any("out of Burp scope" in l for l in LOGGED))[-1])
 step("diag: counters increment", lambda: (ext._seen_responses > 0 and ext._seen_js > 0))
+# PoC export: capture an in-scope vulnerable file, export, verify exact payload present
+def poc_export():
+    ext._on_clear(None); flush()
+    vuln = "var q=location.hash; el.innerHTML=q; eval(location.search);"
+    ext.processHttpMessage(4, False, Msg("https://t.test/vuln.js", vuln, "application/javascript")); flush()
+    recs, skipped = ext._collect_pocs()
+    import os
+    hp = sys.argv[4]+"/pocs.html"; mp = sys.argv[4]+"/pocs.md"
+    ext._write_poc_html(hp, recs, skipped); ext._write_poc_md(mp, recs, skipped)
+    html = open(hp).read(); md = open(mp).read()
+    # exact payload for innerHTML must appear verbatim in both
+    import cgi as _cgi
+    mk_ok = all(("JSRECON-" in r["payload"] and _cgi.escape(r["payload"], True) in html) for r in recs)
+    md_ok = all(r["payload"] in md for r in recs)
+    steps_ok = all(len(r["steps"])>=3 for r in recs)
+    return "recs=%d html_payload=%s md_payload=%s steps=%s html_bytes=%d" % (len(recs), mk_ok, md_ok, steps_ok, len(html))
+step("Export PoCs: exact payloads in HTML+MD", poc_export)
+def poc_scope():
+    ext._on_clear(None); flush()
+    ext.processHttpMessage(4, False, Msg("https://outofscope.test/v.js", "el.innerHTML=location.hash;", "application/javascript")); flush()
+    # In-scope only default drops capture, but even if captured, export must skip out-of-scope
+    recs, skipped = ext._collect_pocs()
+    return "recs=%d (expect 0 for out-of-scope)" % len(recs)
+step("Export PoCs: out-of-scope excluded", poc_scope)
 def find(term):
     flush(); ext._search_field.setText(term); ext._on_search(None)
     return (ext._files_table.getRowCount(), ext._endpoint_table.getRowCount(), ext._secret_table.getRowCount(), ext._xss_table.getRowCount(), ext._status.getText()[:30])

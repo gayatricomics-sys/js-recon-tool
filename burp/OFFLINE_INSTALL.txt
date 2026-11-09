@@ -1,4 +1,4 @@
-JS Recon - Burp Suite extension (offline package)  v1.3.1
+JS Recon - Burp Suite extension (offline package)  v1.4.0
 =========================================================
 
 Everything needed is in this folder. No internet access is required.
@@ -21,7 +21,7 @@ INSTALL (offline)
    jython-standalone-2.7.4.jar from this folder.
 3. Extensions -> Installed -> Add -> Extension type: Python ->
    select js_recon_burp.py -> Next.
-4. The Output tab should show "[JS Recon] JS Recon 1.3.1 loaded." and the
+4. The Output tab should show "[JS Recon] JS Recon 1.4.0 loaded." and the
    Errors tab should be empty. A new "JS Recon" tab appears.
 
 USE
@@ -40,13 +40,17 @@ USE
 - DOM XSS tab: select a row -> "Copy PoC" copies a marker payload for an
   in-scope host. Nothing is sent automatically; you test it manually.
 - Export CSV / Export HTML write UTF-8 files (HTML output is escaped).
+- Export PoCs: writes an HTML + Markdown report of every in-scope DOM XSS
+  finding with its exact copy-paste payload, the vulnerable line, the likely
+  client-controllable source, and concrete steps to reproduce -- ready to
+  paste into a finding. Out-of-scope hosts are omitted.
 
 SELF-TEST (optional, offline)
 -----------------------------
   sh run_selftest.sh
 Every line should start with [OK]; there should be no [FAIL].
 
-ANALYSIS (v1.3.1)
+ANALYSIS (v1.4.0)
 -----------------
 - JavaScript is beautified first (minified bundles become readable), then
   lexed into tokens. Endpoint / secret / DOM XSS / sensitive-function

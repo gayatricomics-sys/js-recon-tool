@@ -62,7 +62,7 @@ import re
 import time
 
 
-VERSION = "1.3.1"
+VERSION = "1.4.0"
 AUTHZ_FILENAME = ".js_recon_authorization"
 
 
@@ -835,28 +835,68 @@ URL_PROP_SINKS = set(["src", "href", "action", "formaction", "data"])
 JQUERY_HTML = set(["html", "append", "prepend", "after", "before", "replaceWith", "wrap", "wrapAll"])
 
 
+# Canonical source -> (human name, replication step). Order matters: most
+# specific first so "location.search" wins over bare "location".
+SOURCE_META = [
+    ("location.hash", "URL fragment (location.hash)",
+     "Append the payload to the page URL fragment:  <TARGET-URL>#PAYLOAD"),
+    ("location.search", "URL query string (location.search)",
+     "Add the payload as the query value this code reads:  <TARGET-URL>?PARAM=PAYLOAD"),
+    ("urlsearchparams", "URL query string (URLSearchParams)",
+     "Add the payload as the query value this code reads:  <TARGET-URL>?PARAM=PAYLOAD"),
+    ("location.pathname", "URL path (location.pathname)",
+     "Craft a target URL whose path contains the payload, then load it."),
+    ("location.href", "URL (location.href)",
+     "Craft a target URL containing the payload, then load it."),
+    ("document.url", "URL (document.URL)",
+     "Craft a target URL containing the payload, then load it."),
+    ("document.documenturi", "URL (document.documentURI)",
+     "Craft a target URL containing the payload, then load it."),
+    ("document.referrer", "Referer header (document.referrer)",
+     "Link to the target from a page you control whose URL contains the payload; the victim arrives with that Referer."),
+    ("window.name", "window.name",
+     "From an attacker page set window.name to the payload, then navigate that window to the target."),
+    ("document.cookie", "Cookie (document.cookie)",
+     "Set the cookie this code reads to the payload (requires an attacker-settable cookie)."),
+    ("localstorage", "localStorage",
+     "Seed the localStorage key this code reads with the payload."),
+    ("sessionstorage", "sessionStorage",
+     "Seed the sessionStorage key this code reads with the payload."),
+    (".data", "postMessage data (event.data)",
+     "From an attacker-controlled page or iframe, postMessage the payload to the target window."),
+    ("location", "URL (location)",
+     "Craft a target URL containing the payload, then load it."),
+]
+_GENERIC_SOURCE = ("the input that reaches this sink",
+                   "Place the payload into the user-controllable input (parameter, field, storage, or message) that reaches this sink.")
+
+
+def _norm(tokens_slice):
+    return slice_text(tokens_slice).lower().replace(" ", "")
+
+
+def _first_source(text):
+    """Canonical source key present in normalized text, or None."""
+    for key, _name, _step in SOURCE_META:
+        if key == "location":
+            import re as _re
+            if _re.search(r"(?<![a-z0-9_$.])location(?![a-z0-9_$])", text):
+                return key
+        elif key in text:
+            return key
+    return None
+
+
 def _chain_has_source(tokens_slice):
-    """True if the token slice reads a known client-controllable source."""
-    low = slice_text(tokens_slice).lower().replace(" . ", ".").replace(" .", ".").replace(". ", ".")
-    for tok_ in SOURCE_TOKENS:
-        if tok_ in low:
-            # avoid "location" matching inside a longer identifier like "relocation"
-            if tok_ == "location":
-                import re as _re
-                if _re.search(r"(?<![a-z0-9_$])location(?![a-z0-9_$])", low):
-                    return True
-            else:
-                return True
-    return False
+    return _first_source(_norm(tokens_slice)) is not None
 
 
 def _collect_tainted(sig):
-    """Variable names whose value derives from a source, bounded fixed point."""
+    """(tainted var names, var -> canonical source key). Bounded fixed point."""
     assigns = []  # (name, value_tokens)
     for i, t in enumerate(sig):
         if t.type == "name" and i + 1 < len(sig) and sig[i + 1].type == "punct" and sig[i + 1].value == "=" \
                 and not (i + 1 < len(sig) and sig[i + 1].value in ("==", "===")):
-            # not a comparison and not => (tokenizer gives those as single tokens)
             prev = sig[i - 1] if i > 0 else None
             if prev is not None and prev.type == "punct" and prev.value in (".", "?."):
                 continue  # member assignment, handled as sink
@@ -867,47 +907,56 @@ def _collect_tainted(sig):
             val, _ = statement_slice(sig, i + 3)
             assigns.append((sig[i + 1].value, val))
 
-    tainted = set()
-    name_set = set(n for n, _ in assigns)
+    tainted = {}  # name -> source key
     for _ in range(6):
         changed = False
         for name, val in assigns:
             if name in tainted:
                 continue
-            if _chain_has_source(val):
-                tainted.add(name)
+            src = _first_source(_norm(val))
+            if src:
+                tainted[name] = src
                 changed = True
                 continue
             for v in val:
                 if v.type == "name" and v.value in tainted:
-                    tainted.add(name)
+                    tainted[name] = tainted[v.value]
                     changed = True
                     break
         if not changed:
             break
-    return tainted
+    return set(tainted.keys()), tainted
 
 
-def _slice_tainted(tokens_slice, tainted):
-    if _chain_has_source(tokens_slice):
-        return True
+def _slice_source_key(tokens_slice, var_source):
+    """Canonical source feeding this slice: a direct source, a tainted var's
+    source, or '.data'. None if not tainted."""
+    direct = _first_source(_norm(tokens_slice))
+    if direct:
+        return direct
     for t in tokens_slice:
-        if t.type == "name" and t.value in tainted:
-            return True
-        if t.type == "name" and "." in slice_text([t]):
-            pass
-    # var.data style
-    txt = slice_text(tokens_slice)
-    if ".data" in txt.replace(" ", ""):
-        return True
-    return False
+        if t.type == "name" and t.value in var_source:
+            return var_source[t.value]
+    if ".data" in _norm(tokens_slice):
+        return ".data"
+    return None
+
+
+def _slice_tainted(tokens_slice, var_source):
+    return _slice_source_key(tokens_slice, var_source) is not None
 
 
 def analyze_dom_xss(source, tokens=None):
     sig = significant(tokens if tokens is not None else tokenize(source))
     findings = []
     seen = set()
-    tainted = _collect_tainted(sig)
+    tainted_set, var_source = _collect_tainted(sig)
+    src_lines = source.split("\n")
+
+    def real_line(line):
+        if line and 1 <= line <= len(src_lines):
+            return src_lines[line - 1].strip()[:300]
+        return ""
 
     def add(sink, target, line, start_idx, arg_tokens, is_tainted, severity=None):
         if severity is None:
@@ -921,13 +970,15 @@ def analyze_dom_xss(source, tokens=None):
         if key in seen:
             return
         seen.add(key)
-        snippet = slice_text(sig[max(0, start_idx - 3):start_idx + 14])[:300]
+        snippet = real_line(line) or slice_text(sig[max(0, start_idx - 2):start_idx + 10])[:300]
+        src_key = _slice_source_key(arg_tokens, var_source) if is_tainted else None
         findings.append({
             "sinkType": sink,
             "target": target,
             "line": line,
             "snippet": snippet,
             "taintedBySource": bool(is_tainted),
+            "sourceKey": src_key,
             "severity": severity,
         })
 
@@ -952,11 +1003,11 @@ def analyze_dom_xss(source, tokens=None):
                     chain = ".".join(parts)
                 if prop in HTML_PROP_SINKS:
                     rhs, _ = statement_slice(sig, i + 1)
-                    add(prop, chain or prop, t.line, i + 1, rhs, _slice_tainted(rhs, tainted))
+                    add(prop, chain or prop, t.line, i + 1, rhs, _slice_tainted(rhs, var_source))
                     continue
                 if prop in URL_PROP_SINKS and chain:
                     rhs, _ = statement_slice(sig, i + 1)
-                    tt = _slice_tainted(rhs, tainted)
+                    tt = _slice_tainted(rhs, var_source)
                     # javascript: URLs or tainted navigations
                     if tt:
                         add(prop + "-assign", chain, t.line, i + 1, rhs, True, "HIGH")
@@ -964,7 +1015,7 @@ def analyze_dom_xss(source, tokens=None):
                 # location = ... / window.location = ...
                 if (prop == "location" or (chain and chain.lower().endswith("location"))):
                     rhs, _ = statement_slice(sig, i + 1)
-                    tt = _slice_tainted(rhs, tainted)
+                    tt = _slice_tainted(rhs, var_source)
                     add("location-assign", chain or "location", t.line, i + 1, rhs, tt,
                         "HIGH" if tt else "INFO")
                     continue
@@ -977,7 +1028,7 @@ def analyze_dom_xss(source, tokens=None):
 
         if is_call:
             args, _ = statement_slice(sig, i + 2)
-            tt = _slice_tainted(args, tainted)
+            tt = _slice_tainted(args, var_source)
 
             if t.value == "eval" and not dotted:
                 add("eval", "eval()", t.line, i, args, tt)
@@ -995,10 +1046,10 @@ def analyze_dom_xss(source, tokens=None):
                     first_depth0.append(a)
                 if first_depth0 and first_depth0[0].type == "string":
                     add(t.value + "-string-arg", t.value, t.line, i, first_depth0,
-                        _slice_tainted(first_depth0, tainted), "MEDIUM")
-                elif first_depth0 and first_depth0[0].type not in ("name",) and _slice_tainted(first_depth0, tainted):
+                        _slice_tainted(first_depth0, var_source), "MEDIUM")
+                elif first_depth0 and first_depth0[0].type not in ("name",) and _slice_tainted(first_depth0, var_source):
                     add(t.value + "-string-arg", t.value, t.line, i, first_depth0, True, "HIGH")
-                elif first_depth0 and first_depth0[0].type == "name" and first_depth0[0].value in tainted \
+                elif first_depth0 and first_depth0[0].type == "name" and first_depth0[0].value in tainted_set \
                         and not (len(first_depth0) > 1 and first_depth0[1].value in ("=>",)):
                     add(t.value + "-string-arg", t.value, t.line, i, first_depth0, True, "HIGH")
                 continue
@@ -1231,6 +1282,92 @@ def payload_for_finding(finding):
     }
     payload = templates.get(sink, '<img src=x onerror="alert(\'%s\')">' % marker)
     return marker, payload
+
+
+# Which execution context the payload lands in, for replication wording.
+_HTML_SINKS = set(["innerHTML", "outerHTML", "srcdoc", "insertAdjacentHTML",
+                   "setHTML", "write", "writeln", "jquery-html", "jquery-selector",
+                   "message-listener"])
+_JS_SINKS = set(["eval", "Function-constructor", "setTimeout-string-arg",
+                 "setInterval-string-arg"])
+_NAV_SINKS = set(["location.assign", "location.replace", "location-assign",
+                  "src-assign", "href-assign"])
+
+
+def _source_from_snippet(snippet):
+    """Best-effort guess of the client-controllable source feeding a sink,
+    from the finding snippet, so replication steps can be concrete."""
+    s = (snippet or "").lower().replace(" ", "")
+    if "location.hash" in s:
+        return ("URL fragment (location.hash)",
+                "Append the payload to the page URL fragment:  <TARGET-URL>#<payload>")
+    if "location.search" in s or "urlsearchparams" in s:
+        return ("URL query string (location.search)",
+                "Add the payload as the query-parameter value this code reads:  <TARGET-URL>?<param>=<payload>")
+    if "location.pathname" in s or "location.href" in s or "document.url" in s or "documenturi" in s:
+        return ("URL (location.href / pathname)",
+                "Craft a target URL whose path/href contains the payload, then load it.")
+    if "document.referrer" in s:
+        return ("Referer header (document.referrer)",
+                "Place a link to the target on a page you control whose URL contains the payload; the victim arrives with that Referer.")
+    if "window.name" in s:
+        return ("window.name",
+                "From an attacker page set window.name to the payload, then navigate that window/tab to the target.")
+    if ".data" in s or "postmessage" in s:
+        return ("postMessage data (event.data)",
+                "From an attacker-controlled page or iframe, postMessage the payload to the target window/iframe.")
+    if "document.cookie" in s:
+        return ("Cookie (document.cookie)",
+                "Set the cookie this code reads to the payload (requires an attacker-settable cookie).")
+    if "localstorage" in s or "sessionstorage" in s:
+        return ("Web storage (local/sessionStorage)",
+                "Seed the storage key this code reads with the payload (e.g. via another injection or a shared subdomain).")
+    return ("the input that reaches this sink",
+            "Place the payload into the user-controllable input (parameter, field, storage, or message) that reaches this sink.")
+
+
+def poc_details(finding, source_file=None, host=None):
+    """Full PoC record for one DOM XSS finding: exact payload + how to replicate."""
+    marker, payload = payload_for_finding(finding)
+    sink = finding.get("sinkType", "")
+    if sink in _JS_SINKS:
+        context = "JavaScript (the payload is executed as script, not HTML)"
+    elif sink in _NAV_SINKS:
+        context = "Navigation (javascript: URL executed when the sink navigates)"
+    else:
+        context = "HTML (the payload is parsed into the DOM)"
+    key = finding.get("sourceKey")
+    meta = None
+    if key:
+        for k, name, step in SOURCE_META:
+            if k == key:
+                meta = (name, step)
+                break
+    if meta is None:
+        meta = _source_from_snippet(finding.get("snippet", ""))
+    source_name, place_step = meta
+    steps = [
+        "Confirm the sink is reachable: %s at %s line %s." % (
+            sink, source_file or finding.get("sourceFile") or "the file", finding.get("line")),
+        place_step.replace("PAYLOAD", payload).replace("<payload>", payload),
+        "Load / trigger the page so the sink runs.",
+        "Success = an alert box and a console warning showing the marker %s." % marker,
+    ]
+    return {
+        "marker": marker,
+        "payload": payload,
+        "sink": sink,
+        "target": finding.get("target", ""),
+        "severity": finding.get("severity", ""),
+        "tainted": bool(finding.get("taintedBySource")),
+        "context": context,
+        "source": source_name,
+        "line": finding.get("line"),
+        "snippet": finding.get("snippet", ""),
+        "sourceFile": source_file,
+        "host": host,
+        "steps": steps,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -1631,6 +1768,8 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener, IContextMenuFactory, IExt
         export_html_btn = JButton("Export HTML", actionPerformed=self._on_export_html)
         copy_btn = JButton("Copy PoC", actionPerformed=self._on_copy_poc)
         gen_all_btn = JButton("Generate all PoCs", actionPerformed=self._on_generate_all_pocs)
+        export_pocs_btn = JButton("Export PoCs", actionPerformed=self._on_export_pocs)
+        export_pocs_btn.setToolTipText("Write every in-scope DOM XSS PoC (exact payload + replication steps) to an HTML and Markdown report.")
         toolbar.add(self._auto_capture)
         toolbar.add(self._scope_only)
         toolbar.add(JLabel("Host filter"))
@@ -1643,6 +1782,7 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener, IContextMenuFactory, IExt
         toolbar.add(export_html_btn)
         toolbar.add(copy_btn)
         toolbar.add(gen_all_btn)
+        toolbar.add(export_pocs_btn)
 
         self._status = JLabel("Ready")
         statusbar = JPanel(BorderLayout())
@@ -1945,6 +2085,157 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener, IContextMenuFactory, IExt
     def _snapshot(self):
         with self._lock:
             return sorted(self._store.values(), key=lambda i: i["id"])
+
+    # -- PoC export ----------------------------------------------------------
+    def _collect_pocs(self):
+        """PoC records for every DOM XSS finding on an in-scope (authorized)
+        host. Returns (records, skipped_out_of_scope_count)."""
+        records = []
+        skipped = 0
+        for item in self._snapshot():
+            authorized = self._is_authorized(item)
+            for finding in item.get("xss", []):
+                if not authorized:
+                    skipped += 1
+                    continue
+                rec = poc_details(finding, source_file=item["url"], host=item["host"])
+                records.append(rec)
+        # Highest severity first.
+        order = {"HIGH": 0, "MEDIUM": 1, "LOW": 2, "INFO": 3}
+        records.sort(key=lambda r: (order.get(r["severity"], 9), r.get("sourceFile") or "", r.get("line") or 0))
+        return records, skipped
+
+    def _on_export_pocs(self, evt):
+        records, skipped = self._collect_pocs()
+        if not records:
+            msg = ("No PoCs to export. DOM XSS PoCs are only exported for hosts in "
+                   "Burp's Target scope%s." % (" (%d finding(s) skipped as out-of-scope)" % skipped if skipped else ""))
+            self._notify(msg)
+            try:
+                JOptionPane.showMessageDialog(self._root, msg, "JS Recon - Export PoCs",
+                                              JOptionPane.INFORMATION_MESSAGE)
+            except Exception:
+                pass
+            return
+        try:
+            from javax.swing import JFileChooser
+            chooser = JFileChooser()
+            chooser.setSelectedFile(File("js_recon_pocs.html"))
+            if chooser.showSaveDialog(self._root) != JFileChooser.APPROVE_OPTION:
+                return
+            target = chooser.getSelectedFile()
+        except Exception as e:
+            self._log("Export dialog error: %s" % e)
+            return
+        path = _u(target.getAbsolutePath())
+        html_path = path if path.lower().endswith((".html", ".htm")) else path + ".html"
+        md_path = (html_path[:html_path.rfind(".")] if "." in html_path else html_path) + ".md"
+        try:
+            self._write_poc_html(html_path, records, skipped)
+            self._write_poc_md(md_path, records, skipped)
+            msg = u"Exported %d PoC(s) to %s and %s" % (len(records), html_path, md_path)
+            if skipped:
+                msg += u"  (%d out-of-scope finding(s) omitted)" % skipped
+            self._log(msg)
+            self._status.setText(msg)
+        except Exception as e:
+            self._log("PoC export error: %s" % e)
+
+    def _write_poc_html(self, path, records, skipped):
+        gen = _u(SimpleDateFormat("yyyy-MM-dd HH:mm:ss z").format(Date()))
+        sev_color = {"HIGH": "#c0152f", "MEDIUM": "#c07515", "LOW": "#4a5568", "INFO": "#2b6cb0"}
+        blocks = []
+        for n, r in enumerate(records, 1):
+            steps = u"".join(u"<li>%s</li>" % _esc(s) for s in r["steps"])
+            c = sev_color.get(r["severity"], "#4a5568")
+            blocks.append(u"""
+  <section class="poc">
+    <h2>%d. <span class="sev" style="background:%s">%s</span> DOM XSS via <code>%s</code></h2>
+    <table class="meta">
+      <tr><th>Location</th><td><code>%s</code> : line %s</td></tr>
+      <tr><th>Host</th><td>%s</td></tr>
+      <tr><th>Sink</th><td><code>%s</code> (target <code>%s</code>)</td></tr>
+      <tr><th>Source-tainted</th><td>%s</td></tr>
+      <tr><th>Likely source</th><td>%s</td></tr>
+      <tr><th>Payload context</th><td>%s</td></tr>
+      <tr><th>Marker</th><td><code>%s</code></td></tr>
+    </table>
+    <h3>Vulnerable code</h3>
+    <pre class="code">%s</pre>
+    <h3>Exact payload (copy verbatim)</h3>
+    <pre class="payload">%s</pre>
+    <h3>Steps to reproduce</h3>
+    <ol>%s</ol>
+  </section>""" % (
+                n, c, _esc(r["severity"]), _esc(r["sink"]),
+                _esc(r["sourceFile"]), r["line"], _esc(r["host"]),
+                _esc(r["sink"]), _esc(r.get("target", "")),
+                "yes (heuristic)" if r["tainted"] else "not confirmed",
+                _esc(r["source"]), _esc(r["context"]), _esc(r["marker"]),
+                _esc(r["snippet"]), _esc(r["payload"]), steps))
+        note = (u"<p class='note'>%d finding(s) were omitted because their host is not in "
+                u"Burp's Target scope.</p>" % skipped) if skipped else u""
+        html = u"""<!doctype html><html><head><meta charset="utf-8">
+<title>JS Recon - DOM XSS PoCs</title>
+<style>
+ body{font-family:-apple-system,Segoe UI,Roboto,sans-serif;margin:32px;color:#1a202c;line-height:1.5}
+ h1{border-bottom:3px solid #1a202c;padding-bottom:8px}
+ .poc{border:1px solid #cbd5e0;border-radius:8px;padding:12px 18px;margin:18px 0}
+ .sev{color:#fff;padding:2px 8px;border-radius:4px;font-size:13px;margin-right:6px}
+ table.meta{border-collapse:collapse;margin:8px 0}
+ table.meta th{text-align:left;padding:2px 12px 2px 0;color:#4a5568;white-space:nowrap;vertical-align:top}
+ pre{background:#f1f5f9;border:1px solid #e2e8f0;border-radius:6px;padding:10px;white-space:pre-wrap;word-break:break-word}
+ pre.payload{background:#fff5f5;border-color:#fc8181;font-weight:600}
+ code{background:#f1f5f9;padding:1px 4px;border-radius:3px}
+ .note{background:#fffbea;border:1px solid #f0d878;padding:8px 12px;border-radius:6px}
+ .disc{background:#fffbea;border:1px solid #f0d878;padding:10px 14px;border-radius:6px;font-size:13px}
+</style></head><body>
+<h1>DOM XSS Proof-of-Concept Payloads</h1>
+<p><b>Generated:</b> %s &nbsp; <b>Findings:</b> %d</p>
+<div class="disc">Each payload embeds a unique marker and, if executed, raises an alert and a console warning for unambiguous confirmation. Use only against hosts you are authorized to test. Findings are from static analysis and must be confirmed manually.</div>
+%s
+%s
+</body></html>""" % (_esc(gen), len(records), note, u"".join(blocks))
+        with codecs.open(path, "w", "utf-8") as f:
+            f.write(html)
+
+    def _write_poc_md(self, path, records, skipped):
+        gen = _u(SimpleDateFormat("yyyy-MM-dd HH:mm:ss z").format(Date()))
+        out = [u"# DOM XSS Proof-of-Concept Payloads", u"",
+               u"Generated: %s  |  Findings: %d" % (gen, len(records)), u""]
+        if skipped:
+            out.append(u"> %d finding(s) omitted (host not in Burp Target scope)." % skipped)
+            out.append(u"")
+        for n, r in enumerate(records, 1):
+            out.append(u"## %d. [%s] DOM XSS via `%s`" % (n, r["severity"], r["sink"]))
+            out.append(u"")
+            out.append(u"- **Location:** `%s` line %s" % (r["sourceFile"], r["line"]))
+            out.append(u"- **Host:** %s" % r["host"])
+            out.append(u"- **Sink / target:** `%s` / `%s`" % (r["sink"], r.get("target", "")))
+            out.append(u"- **Source-tainted:** %s" % ("yes (heuristic)" if r["tainted"] else "not confirmed"))
+            out.append(u"- **Likely source:** %s" % r["source"])
+            out.append(u"- **Payload context:** %s" % r["context"])
+            out.append(u"- **Marker:** `%s`" % r["marker"])
+            out.append(u"")
+            out.append(u"**Vulnerable code:**")
+            out.append(u"")
+            out.append(u"```js")
+            out.append(r["snippet"])
+            out.append(u"```")
+            out.append(u"")
+            out.append(u"**Exact payload:**")
+            out.append(u"")
+            out.append(u"```")
+            out.append(r["payload"])
+            out.append(u"```")
+            out.append(u"")
+            out.append(u"**Steps to reproduce:**")
+            out.append(u"")
+            for i, s in enumerate(r["steps"], 1):
+                out.append(u"%d. %s" % (i, s))
+            out.append(u"")
+        with codecs.open(path, "w", "utf-8") as f:
+            f.write(u"\n".join(out))
 
     def _write_csv(self, path):
         with codecs.open(path, "w", "utf-8") as f:
