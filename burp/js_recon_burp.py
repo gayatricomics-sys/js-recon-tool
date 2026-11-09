@@ -62,7 +62,7 @@ import re
 import time
 
 
-VERSION = "1.6.1"
+VERSION = "1.7.0"
 AUTHZ_FILENAME = ".js_recon_authorization"
 
 
@@ -1947,6 +1947,9 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener, IContextMenuFactory, IExt
         self._page_url_field = JTextField(26)
         self._page_url_field.setToolTipText("The page that LOADS the vulnerable script (not the .js URL). Prefilled from the selected finding's host; edit as needed.")
         toolbar2.add(self._page_url_field)
+        self._use_burp_browser = JCheckBox("Use Burp browser", True)
+        self._use_burp_browser.setToolTipText("Fire in Burp's bundled Chromium (proxied through Burp, certs ignored) if it can be found; otherwise falls back to your default browser.")
+        toolbar2.add(self._use_burp_browser)
         fire_btn = JButton("Fire in browser", actionPerformed=self._on_fire_in_browser)
         fire_btn.setToolTipText("Deliver the payload for the selected finding: URL sources open a test URL; postMessage/window.name open a trigger harness; cookie/storage give a console snippet. In-scope hosts only; confirms first.")
         fire_cap_btn = JButton("Fire + capture PoC", actionPerformed=self._on_fire_capture_poc)
@@ -2269,6 +2272,21 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener, IContextMenuFactory, IExt
         with self._lock:
             return sorted(self._store.values(), key=lambda i: i["id"])
 
+    def _attach_trigger(self, rec, finding, page_url):
+        try:
+            trig = build_trigger(page_url, finding.get("sourceKey"), rec["payload"])
+            if trig["mode"] == "console":
+                rec["trigger_kind"] = u"Console snippet (paste in the target's DevTools console)"
+                rec["trigger_text"] = trig["console"]
+            elif trig["mode"] == "harness":
+                rec["trigger_kind"] = u"Trigger harness page (save as .html and open)"
+                rec["trigger_text"] = trig["harness"]
+            elif trig["mode"] == "url":
+                rec["trigger_kind"] = u"Test URL"
+                rec["trigger_text"] = trig["url"]
+        except Exception:
+            pass
+
     # -- PoC export ----------------------------------------------------------
     def _collect_pocs(self):
         """PoC records for every DOM XSS finding on an in-scope (authorized)
@@ -2282,6 +2300,7 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener, IContextMenuFactory, IExt
                     skipped += 1
                     continue
                 rec = poc_details(finding, source_file=item["url"], host=item["host"])
+                self._attach_trigger(rec, finding, u"https://%s/" % _u(item["host"]))
                 shot = self._shots.get(rec["marker"])
                 if shot:
                     rec["shot_b64"] = shot["b64"]
@@ -2365,13 +2384,18 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener, IContextMenuFactory, IExt
     <h3>Steps to reproduce</h3>
     <ol>%s</ol>
     %s
+    %s
   </section>""" % (
                 n, c, _esc(r["severity"]), _esc(r["sink"]),
                 _esc(r["sourceFile"]), r["line"], _esc(r["host"]),
                 _esc(r["sink"]), _esc(r.get("target", "")),
                 "yes (heuristic)" if r["tainted"] else "not confirmed",
                 _esc(r["source"]), _esc(r["context"]), _esc(r["marker"]),
-                _esc(r["snippet"]), _esc(r.get("injected", "")), _esc(r["payload"]), steps, shot))
+                _esc(r["snippet"]), _esc(r.get("injected", "")), _esc(r["payload"]), steps,
+                (u"<h3>Trigger: %s</h3><pre class=\"code\">%s</pre>" % (
+                    _esc(r.get("trigger_kind", "")), _esc(r.get("trigger_text", "")))
+                 if r.get("trigger_text") else u""),
+                shot))
         guide = u"".join(u"<li>%s</li>" % _esc(s) for s in EXECUTION_GUIDE)
         how_to = (u'<h2>How to execute a DOM XSS (general method)</h2>'
                   u'<ol class="guide">%s</ol>' % guide)
@@ -2452,6 +2476,14 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener, IContextMenuFactory, IExt
             for i, s in enumerate(r["steps"], 1):
                 out.append(u"%d. %s" % (i, s))
             out.append(u"")
+            if r.get("trigger_text"):
+                out.append(u"**Trigger (%s):**" % r.get("trigger_kind", ""))
+                out.append(u"")
+                lang = "html" if "harness" in (r.get("trigger_kind", "")).lower() else ""
+                out.append(u"```%s" % lang)
+                out.append(r["trigger_text"])
+                out.append(u"```")
+                out.append(u"")
             out.append(u"**Screenshot (popup proof):**")
             out.append(u"")
             if r.get("shot_bytes") is not None:
@@ -2570,6 +2602,103 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener, IContextMenuFactory, IExt
             return True
         return False
 
+    def _burp_proxy_port(self):
+        try:
+            cfg = _u(self._callbacks.saveConfigAsJson("proxy.request_listeners"))
+            d = json.loads(cfg)
+            listeners = d.get("proxy", {}).get("request_listeners", []) or []
+            for l in listeners:
+                if l.get("running", True) and l.get("listener_port"):
+                    return int(l["listener_port"])
+            if listeners and listeners[0].get("listener_port"):
+                return int(listeners[0]["listener_port"])
+        except Exception as e:
+            self._log("Could not read Burp proxy port: %s" % e)
+        return None
+
+    def _find_burp_browser(self):
+        import os
+        home = _u(System.getProperty("user.home"))
+        roots = [
+            os.path.join(home, ".BurpSuite", "burpbrowser"),
+            os.path.join(home, "AppData", "Roaming", "BurpSuite", "burpbrowser"),
+            os.path.join(home, "Library", "Application Support", "BurpSuite", "burpbrowser"),
+        ]
+        exe_names = set(["chrome", "chrome.exe", "Chromium", "Google Chrome for Testing"])
+        found = []
+        for root in roots:
+            if not os.path.isdir(root):
+                continue
+            for ver in sorted(os.listdir(root)):
+                vdir = os.path.join(root, ver)
+                if not os.path.isdir(vdir):
+                    continue
+                for dirpath, dirs, files in os.walk(vdir):
+                    for f in files:
+                        if f in exe_names:
+                            p = os.path.join(dirpath, f)
+                            found.append((ver, p))
+        if not found:
+            return None
+        found.sort()
+        return found[-1][1]
+
+    def _launch_burp_browser(self, url):
+        import os
+        exe = self._find_burp_browser()
+        if not exe:
+            return False, "Burp's embedded browser was not found on disk."
+        port = self._burp_proxy_port()
+        udd = os.path.join(_u(System.getProperty("java.io.tmpdir")), "jsrecon-burpbrowser")
+        args = [exe]
+        if port:
+            args.append("--proxy-server=127.0.0.1:%d" % port)
+        args += ["--ignore-certificate-errors", "--no-first-run",
+                 "--no-default-browser-check", "--user-data-dir=" + udd,
+                 "--new-window", url]
+        try:
+            from java.lang import ProcessBuilder
+            from java.util import ArrayList
+            jargs = ArrayList()
+            for a in args:
+                jargs.add(a)
+            ProcessBuilder(jargs).start()
+            return True, "Launched Burp's embedded browser (proxy 127.0.0.1:%s)." % (port or "?")
+        except Exception as e:
+            return False, "Failed to launch Burp browser: %s" % e
+
+    def _open_fire(self, uri):
+        """Open the fire URL/harness, preferring Burp's bundled browser."""
+        if self._use_burp_browser.isSelected():
+            ok, msg = self._launch_burp_browser(uri)
+            self._log(msg)
+            if ok:
+                self._status.setText(msg)
+                return True
+            self._log("Falling back to default browser.")
+        return self._browse(uri)
+
+    def _show_copyable(self, title, text, intro=u""):
+        """Dialog with a selectable/copyable text area (JOptionPane messages
+        are not selectable)."""
+        try:
+            from javax.swing import JTextArea, JScrollPane, JPanel as _JPanel, JLabel as _JLabel
+            from java.awt import BorderLayout as _BL, Dimension as _Dim
+            area = JTextArea(text)
+            area.setEditable(True)
+            area.setLineWrap(False)
+            area.setCaretPosition(0)
+            area.selectAll()
+            sp = JScrollPane(area)
+            sp.setPreferredSize(_Dim(640, 220))
+            panel = _JPanel(_BL())
+            if intro:
+                panel.add(_JLabel("<html>" + _esc(intro).replace("\n", "<br>") + "</html>"), _BL.NORTH)
+            panel.add(sp, _BL.CENTER)
+            JOptionPane.showMessageDialog(self._root, panel, title, JOptionPane.INFORMATION_MESSAGE)
+        except Exception as e:
+            JOptionPane.showMessageDialog(self._root, intro + u"\n\n" + text, title, JOptionPane.INFORMATION_MESSAGE)
+
     def _write_harness(self, marker, html):
         from java.io import File as _JFile
         tmp = _JFile(_u(System.getProperty("java.io.tmpdir")), u"jsrecon-trigger-%s.html" % marker)
@@ -2603,12 +2732,14 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener, IContextMenuFactory, IExt
         trig = build_trigger(page_url, finding.get("sourceKey"), payload)
         mode = trig["mode"]
 
+        browser_name = "Burp browser" if self._use_burp_browser.isSelected() else "default browser"
+
         if mode == "manual":
-            JOptionPane.showMessageDialog(
-                self._root,
-                u"This source (%s) can't be fired from a URL.\n\n%s\n\nManual steps:\n- %s" % (
-                    rec["source"], trig.get("note", ""), u"\n- ".join(rec["steps"])),
-                "JS Recon - Fire", JOptionPane.INFORMATION_MESSAGE)
+            self._show_copyable(
+                "JS Recon - Fire (manual trigger)",
+                payload + u"\n\n" + u"\n".join(u"%d. %s" % (i, s) for i, s in enumerate(rec["steps"], 1)),
+                intro=u"This source (%s) can't be fired from a URL. %s\nPayload and steps (selectable / copyable):" % (
+                    rec["source"], trig.get("note", "")))
             return
 
         if mode == "console":
@@ -2616,15 +2747,16 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener, IContextMenuFactory, IExt
             self._clip(snippet)
             opened = False
             try:
-                opened = self._browse(page_url)
+                opened = self._open_fire(page_url)
             except Exception:
                 opened = False
-            JOptionPane.showMessageDialog(
-                self._root,
-                u"%s source.\n\nThe console snippet below is COPIED to your clipboard%s:\n\n%s\n\n"
-                u"Open DevTools (F12) > Console on the target, paste it, run, and the page reloads with the payload." % (
-                    rec["source"], " and the target was opened" if opened else "", snippet),
-                "JS Recon - Fire (console trigger)", JOptionPane.INFORMATION_MESSAGE)
+            self._show_copyable(
+                "JS Recon - Fire (console trigger)",
+                snippet,
+                intro=u"%s source. The snippet is copied to your clipboard%s, and shown below "
+                      u"(select + Ctrl/Cmd-C to copy again).\nOpen DevTools (F12) > Console on the "
+                      u"target, paste it, run; the page reloads with the payload." % (
+                          rec["source"], u" and the target was opened in your %s" % browser_name if opened else u""))
             if auto_capture:
                 self._schedule_capture(item, finding, note="paste the console snippet, then the alert appears")
             return
@@ -2633,11 +2765,9 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener, IContextMenuFactory, IExt
         if mode == "url":
             edited = JOptionPane.showInputDialog(
                 self._root,
-                u"ACTIVE TEST: opens the live target in your default browser.\n"
+                u"ACTIVE TEST: opens the live target in your %s.\n"
                 u"Host is in Burp scope (authorized). %s\n\n"
-                u"Tip: to use Burp's embedded browser instead, cancel and paste this URL there "
-                u"(the extension API can't open Burp's browser directly).\n\n"
-                u"Review/edit the exact URL, then OK to open:" % trig.get("note", ""),
+                u"Review/edit the exact URL, then OK to open:" % (browser_name, trig.get("note", "")),
                 trig["url"])
             if edited is None:
                 self._status.setText("Fire cancelled.")
@@ -2651,9 +2781,9 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener, IContextMenuFactory, IExt
             uri, fpath = self._write_harness(marker, trig["harness"])
             ok = JOptionPane.showConfirmDialog(
                 self._root,
-                u"ACTIVE TEST (%s): a local trigger page will open in your default browser and "
+                u"ACTIVE TEST (%s): a local trigger page will open in your %s and "
                 u"deliver the payload to the target.\n%s\nHarness: %s\n\nProceed?" % (
-                    rec["source"], trig.get("note", ""), fpath),
+                    rec["source"], browser_name, trig.get("note", ""), fpath),
                 "JS Recon - Fire (trigger harness)", JOptionPane.OK_CANCEL_OPTION)
             if ok != JOptionPane.OK_OPTION:
                 self._status.setText("Fire cancelled.")
@@ -2662,10 +2792,10 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener, IContextMenuFactory, IExt
             what = u"trigger harness"
 
         try:
-            if self._browse(target_uri):
-                msg = u"Opened %s in default browser (marker %s)." % (what, marker)
+            if self._open_fire(target_uri):
+                msg = u"Opened %s in %s (marker %s)." % (what, browser_name, marker)
                 if auto_capture:
-                    msg += u" Auto-capturing the screen in %ds -- make sure the alert is visible." % self._capture_delay()
+                    msg += u" Auto-capturing in %ds -- keep the alert visible." % self._capture_delay()
                 else:
                     msg += u" When the alert shows, click 'Capture screenshot'."
                 self._log(msg)
@@ -2674,7 +2804,7 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener, IContextMenuFactory, IExt
                     self._schedule_capture(item, finding, note="")
             else:
                 self._clip(target_uri)
-                self._notify("Desktop browse not supported here; the URL/file was copied to the clipboard.")
+                self._notify("Could not open a browser; the URL/file was copied to the clipboard - paste it into Burp's browser.")
         except Exception as e:
             self._clip(target_uri)
             self._notify("Could not open browser (%s); copied to clipboard instead." % e)
@@ -2797,6 +2927,7 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener, IContextMenuFactory, IExt
     def _export_single_poc(self, item, finding):
         """Write a one-finding PoC report (HTML + MD) with its screenshot."""
         rec = poc_details(finding, source_file=item["url"], host=item["host"])
+        self._attach_trigger(rec, finding, self._default_page_url(item))
         shot = self._shots.get(rec["marker"])
         if shot:
             rec["shot_b64"] = shot["b64"]

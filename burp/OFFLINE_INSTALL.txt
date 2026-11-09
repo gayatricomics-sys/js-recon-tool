@@ -1,4 +1,4 @@
-JS Recon - Burp Suite extension (offline package)  v1.6.1
+JS Recon - Burp Suite extension (offline package)  v1.7.0
 =========================================================
 
 Everything needed is in this folder. No internet access is required.
@@ -21,7 +21,7 @@ INSTALL (offline)
    jython-standalone-2.7.4.jar from this folder.
 3. Extensions -> Installed -> Add -> Extension type: Python ->
    select js_recon_burp.py -> Next.
-4. The Output tab should show "[JS Recon] JS Recon 1.6.1 loaded." and the
+4. The Output tab should show "[JS Recon] JS Recon 1.7.0 loaded." and the
    Errors tab should be empty. A new "JS Recon" tab appears.
 
 USE
@@ -65,16 +65,22 @@ USE
     minimized for ~1s during the shot, then restored. For a tight popup-
     only image, take an OS screenshot of the alert and use "Attach
     screenshot file" instead.
-  NOTE: firing opens the LIVE target in your DEFAULT browser; the extension
-  API cannot open Burp's embedded browser, but you can paste the URL there.
-  Only in-scope hosts are allowed, and every fire is confirmed first.
+  * "Use Burp browser" (on by default): fires in Burp's bundled Chromium,
+    launched with Burp's proxy and --ignore-certificate-errors, so traffic
+    goes through Burp. If the browser binary isn't found it falls back to your
+    default browser.
+  * Console snippets and manual steps are shown in a selectable/copyable text
+    box, and the trigger (console snippet / harness / test URL) is also included
+    in the PoC report so it can be copied there.
+  NOTE: firing opens the LIVE target; only in-scope hosts are allowed, and
+  every fire is confirmed first.
 
 SELF-TEST (optional, offline)
 -----------------------------
   sh run_selftest.sh
 Every line should start with [OK]; there should be no [FAIL].
 
-ANALYSIS (v1.6.1)
+ANALYSIS (v1.7.0)
 -----------------
 - JavaScript is beautified first (minified bundles become readable), then
   lexed into tokens. Endpoint / secret / DOM XSS / sensitive-function

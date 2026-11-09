@@ -59,6 +59,7 @@ class CB(object):
     def isInScope(s, u): return unicode(u.getHost()) in SCOPE
     def printOutput(s, m):
         LOGGED.append(unicode(m)); print(m)
+    def saveConfigAsJson(s, *a): return '{"proxy":{"request_listeners":[{"running":true,"listener_port":8080}]}}'
 
 def step(name, fn):
     try:
@@ -169,6 +170,19 @@ def shot_export():
     md_ok = (("poc-%s.png"%mk) in md) and os.path.exists(sys.argv[4]+"/poc-%s.png"%mk) and ("How to execute" in md)
     return "html_shot+guide=%s md_pngref+guide=%s" % (html_ok, md_ok)
 step("Screenshot embeds in HTML + PNG file for MD + guide", shot_export)
+step("burp proxy port parsed", lambda: ext._burp_proxy_port())
+step("find burp browser (none in sandbox) -> None", lambda: ext._find_burp_browser() is None)
+step("launch burp browser returns (bool,msg)", lambda: (lambda r: isinstance(r, tuple) and r[0] is False)(ext._launch_burp_browser("https://t.test/")))
+def trigger_in_report():
+    ext._on_clear(None); flush()
+    ext.processHttpMessage(4, False, Msg("https://t.test/pm.js", "window.addEventListener('message',function(ev){d.innerHTML=ev.data;});", "application/javascript")); flush()
+    recs, _ = ext._collect_pocs()
+    hp=sys.argv[4]+"/pocs_trig.html"; mp=sys.argv[4]+"/pocs_trig.md"
+    ext._write_poc_html(hp, recs, 0); ext._write_poc_md(mp, recs, 0)
+    html=open(hp).read(); md=open(mp).read()
+    has = any(r.get("trigger_text") for r in recs)
+    return "trigger_rec=%s html_has=%s md_has=%s" % (has, ("Trigger:" in html or "Trigger " in html), ("Trigger (" in md))
+step("trigger snippet in PoC report (postMessage)", trigger_in_report)
 step("trigger url mode (hash)", lambda: M.build_trigger("https://t.test/p","location.hash","<x>")["mode"] == "url")
 step("trigger harness postMessage", lambda: (lambda t: t["mode"]=="harness" and "postMessage" in t["harness"] and "<x>" in t["harness"])(M.build_trigger("https://t.test/p",".data","<x>")))
 step("trigger harness window.name", lambda: (lambda t: t["mode"]=="harness" and "window.name" in t["harness"])(M.build_trigger("https://t.test/p","window.name","<x>")))
