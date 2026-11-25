@@ -32,14 +32,14 @@ This extension is passive and does not attack or modify traffic.
 from burp import IBurpExtender, ITab, IHttpListener, IContextMenuFactory, IExtensionStateListener
 from burp import IParameter
 
-from java.awt import BorderLayout, Dimension, Font, Color, GridBagLayout, GridBagConstraints, Insets, Toolkit, GridLayout
+from java.awt import BorderLayout, Dimension, Font, Color, GridBagLayout, GridBagConstraints, Insets, Toolkit, GridLayout, FlowLayout, Component
 from java.awt.datatransfer import StringSelection
 from java.awt.event import ActionListener, KeyListener
 from javax.swing import (JPanel, JLabel, JTextField, JButton, JCheckBox, JComboBox,
                          JTable, JTextArea, JScrollPane, JTabbedPane, JSplitPane,
                          SwingConstants, ListSelectionModel, SwingUtilities, BorderFactory,
                          JMenuBar, JMenu, JMenuItem, JOptionPane, JPasswordField)
-from javax.swing import RowFilter
+from javax.swing import RowFilter, BoxLayout, Box, BorderFactory as _BF
 from javax.swing.table import AbstractTableModel, TableRowSorter
 from javax.swing.event import ListSelectionListener
 from java.lang import Runnable, Thread, System, String as JString, Long
@@ -62,7 +62,7 @@ import re
 import time
 
 
-VERSION = "1.7.0"
+VERSION = "1.8.0"
 AUTHZ_FILENAME = ".js_recon_authorization"
 
 
@@ -1889,94 +1889,94 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener, IContextMenuFactory, IExt
         self._by_url = {}
         self._host_filter_cache = set()
 
-        # Authorization banner: Burp's Target scope IS the authorization. Hosts
-        # you add to Target -> Scope are treated as authorized automatically;
-        # there is no separate host box or checkbox to fill in.
-        banner = JPanel(GridBagLayout())
-        banner.setBorder(BorderFactory.createCompoundBorder(
-            BorderFactory.createEmptyBorder(4, 8, 4, 8),
-            BorderFactory.createTitledBorder("Authorization = Burp Target scope")))
-        banner.setBackground(Color(0xFF, 0xF6, 0xE5))
-        gbc = GridBagConstraints()
-        gbc.gridx = 0
-        gbc.gridy = 0
-        gbc.anchor = GridBagConstraints.WEST
-        gbc.insets = Insets(2, 2, 2, 6)
+        # --- Controls, laid out as left-aligned rows that stack cleanly -----
+        def row(title=None):
+            p = JPanel(FlowLayout(FlowLayout.LEFT, 6, 3))
+            p.setOpaque(False)
+            if title:
+                p.setBorder(_BF.createTitledBorder(title))
+            return p
+
+        # Thin authorization banner (single line; full text in the tooltip).
         self._authz_status = JLabel(
+            "Authorization = Burp Target scope: in-scope hosts are authorized; PoCs only for in-scope URLs.")
+        self._authz_status.setToolTipText(
             "Hosts in Burp's Target scope are treated as authorized targets. "
             "PoC payloads are only generated for in-scope URLs; out-of-scope hosts stay passive.")
-        banner.add(self._authz_status, gbc)
+        banner = JPanel(FlowLayout(FlowLayout.LEFT, 8, 3))
+        banner.setBackground(Color(0xFF, 0xF6, 0xE5))
+        banner.setBorder(_BF.createMatteBorder(0, 0, 1, 0, Color(0xE0, 0xD5, 0xB0)))
+        banner.add(self._authz_status)
 
-        # Toolbar
-        toolbar = JPanel()
+        # Capture controls
         self._auto_capture = JCheckBox("Passive capture", True)
-        # Default ON: only the target(s) you added to Burp scope are captured.
         self._scope_only = JCheckBox("In-scope only", True)
         self._scope_only.setToolTipText("Capture only URLs in Burp's Target scope. Untick to capture all JavaScript seen by the proxy.")
         self._host_filter = JTextField(14)
-        # Press Enter in the host filter to re-apply it to existing findings.
         self._host_filter.addActionListener(lambda evt: self._refresh_tables())
         self._search_field = JTextField(18)
         self._search_field.setToolTipText("Text to find in URLs, source, endpoints, secrets and DOM XSS rows. Press Enter or Find; empty + Find shows all.")
-        self._search_field.addActionListener(self._on_search)  # Enter runs Find
-        search_btn2 = JButton("Find", actionPerformed=self._on_search)
-        clear_btn = JButton("Clear", actionPerformed=self._on_clear)
-        export_csv_btn = JButton("Export CSV", actionPerformed=self._on_export_csv)
-        export_html_btn = JButton("Export HTML", actionPerformed=self._on_export_html)
-        copy_btn = JButton("Copy PoC", actionPerformed=self._on_copy_poc)
-        gen_all_btn = JButton("Generate all PoCs", actionPerformed=self._on_generate_all_pocs)
-        export_pocs_btn = JButton("Export PoCs", actionPerformed=self._on_export_pocs)
-        export_pocs_btn.setToolTipText("Write every in-scope DOM XSS PoC (exact payload + replication steps) to an HTML and Markdown report.")
-        toolbar.add(self._auto_capture)
-        toolbar.add(self._scope_only)
-        toolbar.add(JLabel("Host filter"))
-        toolbar.add(self._host_filter)
-        toolbar.add(JLabel("Search"))
-        toolbar.add(self._search_field)
-        toolbar.add(search_btn2)
-        toolbar.add(clear_btn)
-        toolbar.add(export_csv_btn)
-        toolbar.add(export_html_btn)
-        toolbar.add(copy_btn)
-        toolbar.add(gen_all_btn)
-        toolbar.add(export_pocs_btn)
+        self._search_field.addActionListener(self._on_search)
+        row_capture = row("Capture")
+        row_capture.add(self._auto_capture)
+        row_capture.add(self._scope_only)
+        row_capture.add(JLabel("Host"))
+        row_capture.add(self._host_filter)
+        row_capture.add(JLabel("Search"))
+        row_capture.add(self._search_field)
+        row_capture.add(JButton("Find", actionPerformed=self._on_search))
+        row_capture.add(JButton("Clear", actionPerformed=self._on_clear))
 
-        # Second row: active DOM XSS verification (scope-gated, user-initiated).
-        toolbar2 = JPanel()
-        toolbar2.add(JLabel("Target page URL"))
-        self._page_url_field = JTextField(26)
+        # Export / PoC controls
+        export_pocs_btn = JButton("Export PoCs", actionPerformed=self._on_export_pocs)
+        export_pocs_btn.setToolTipText("Write every in-scope DOM XSS PoC (exact payload + replication steps + screenshot) to an HTML and Markdown report.")
+        row_export = row("Export")
+        row_export.add(JButton("Export CSV", actionPerformed=self._on_export_csv))
+        row_export.add(JButton("Export HTML", actionPerformed=self._on_export_html))
+        row_export.add(JButton("Copy PoC", actionPerformed=self._on_copy_poc))
+        row_export.add(JButton("Generate all PoCs", actionPerformed=self._on_generate_all_pocs))
+        row_export.add(export_pocs_btn)
+
+        # Active DOM XSS verification controls
+        self._page_url_field = JTextField(24)
         self._page_url_field.setToolTipText("The page that LOADS the vulnerable script (not the .js URL). Prefilled from the selected finding's host; edit as needed.")
-        toolbar2.add(self._page_url_field)
         self._use_burp_browser = JCheckBox("Use Burp browser", True)
         self._use_burp_browser.setToolTipText("Fire in Burp's bundled Chromium (proxied through Burp, certs ignored) if it can be found; otherwise falls back to your default browser.")
-        toolbar2.add(self._use_burp_browser)
+        self._delay_field = JTextField("4", 2)
+        self._delay_field.setToolTipText("Seconds to wait after firing before the automatic screenshot (time for the alert to appear).")
         fire_btn = JButton("Fire in browser", actionPerformed=self._on_fire_in_browser)
         fire_btn.setToolTipText("Deliver the payload for the selected finding: URL sources open a test URL; postMessage/window.name open a trigger harness; cookie/storage give a console snippet. In-scope hosts only; confirms first.")
         fire_cap_btn = JButton("Fire + capture PoC", actionPerformed=self._on_fire_capture_poc)
-        fire_cap_btn.setToolTipText("Fire, then after the delay auto-capture the screen and save this finding as a PoC (HTML + Markdown) with the screenshot.")
-        toolbar2.add(fire_cap_btn)
-        toolbar2.add(JLabel("Capture delay s"))
-        self._delay_field = JTextField("4", 2)
-        self._delay_field.setToolTipText("Seconds to wait after firing before the automatic screenshot (time for the alert to appear).")
-        toolbar2.add(self._delay_field)
+        fire_cap_btn.setToolTipText("Fire, then after the delay auto-capture the screen (Burp minimized) and save this finding as a PoC with the screenshot.")
         shot_btn = JButton("Capture screenshot", actionPerformed=self._on_capture_screenshot)
-        shot_btn.setToolTipText("Capture the current screen (showing the alert) and attach it to the selected finding for the PoC report.")
+        shot_btn.setToolTipText("Capture the browser alert (Burp is minimized for the shot) and attach it to the selected finding.")
         attach_btn = JButton("Attach screenshot file", actionPerformed=self._on_attach_screenshot)
         attach_btn.setToolTipText("Attach an existing image file as the screenshot proof for the selected finding.")
-        toolbar2.add(fire_btn)
-        toolbar2.add(shot_btn)
-        toolbar2.add(attach_btn)
+        row_active = row("Active DOM XSS verification (selected finding; in-scope only)")
+        row_active.add(JLabel("Target page URL"))
+        row_active.add(self._page_url_field)
+        row_active.add(self._use_burp_browser)
+        row_active.add(fire_btn)
+        row_active.add(fire_cap_btn)
+        row_active.add(JLabel("delay s"))
+        row_active.add(self._delay_field)
+        row_active.add(shot_btn)
+        row_active.add(attach_btn)
 
         self._status = JLabel("Ready")
         statusbar = JPanel(BorderLayout())
+        statusbar.setBorder(_BF.createMatteBorder(1, 0, 0, 0, Color(0xD0, 0xD0, 0xD0)))
         statusbar.add(self._status, BorderLayout.WEST)
 
-        toolbars = JPanel(GridLayout(2, 1))
-        toolbars.add(toolbar)
-        toolbars.add(toolbar2)
+        toolbars = JPanel()
+        toolbars.setLayout(BoxLayout(toolbars, BoxLayout.Y_AXIS))
+        toolbars.setOpaque(False)
+        for r in (banner, row_capture, row_export, row_active):
+            r.setAlignmentX(Component.LEFT_ALIGNMENT)
+            r.setMaximumSize(Dimension(100000, r.getPreferredSize().height))
+            toolbars.add(r)
         top = JPanel(BorderLayout())
         top.add(toolbars, BorderLayout.NORTH)
-        top.add(banner, BorderLayout.CENTER)
 
         # Main tabbed pane
         self._tabs = JTabbedPane()
@@ -2028,6 +2028,16 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener, IContextMenuFactory, IExt
         self._log_area = JTextArea()
         self._log_area.setEditable(False)
         self._tabs.addTab("Log", JScrollPane(self._log_area))
+
+        # Readability: keep table columns at their width (horizontal scroll
+        # instead of squeezing), and use a monospaced font for code views.
+        mono = Font("Monospaced", Font.PLAIN, 12)
+        self._file_detail.setFont(mono)
+        self._log_area.setFont(mono)
+        for tbl in (self._files_table, self._endpoint_table, self._secret_table, self._xss_table):
+            tbl.setAutoResizeMode(JTable.AUTO_RESIZE_OFF)
+            tbl.setFillsViewportHeight(True)
+            tbl.setRowHeight(20)
 
         center = JPanel(BorderLayout())
         center.add(top, BorderLayout.NORTH)
