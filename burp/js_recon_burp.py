@@ -62,7 +62,7 @@ import re
 import time
 
 
-VERSION = "1.8.0"
+VERSION = "1.8.1"
 AUTHZ_FILENAME = ".js_recon_authorization"
 
 
@@ -2604,12 +2604,86 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener, IContextMenuFactory, IExt
         except Exception:
             return u""
 
-    def _browse(self, url_or_file_uri):
-        from java.awt import Desktop
-        from java.net import URI
-        if Desktop.isDesktopSupported() and Desktop.getDesktop().isSupported(Desktop.Action.BROWSE):
-            Desktop.getDesktop().browse(URI(url_or_file_uri))
+    def _spawn(self, args):
+        from java.lang import ProcessBuilder
+        from java.util import ArrayList
+        jargs = ArrayList()
+        for a in args:
+            jargs.add(_u(a))
+        ProcessBuilder(jargs).start()
+
+    def _find_system_browser(self):
+        """A system browser executable, to launch URLs with special characters
+        as a raw process argument (java.net.URI would reject the PoC URL)."""
+        import os
+        osname = _u(System.getProperty("os.name")).lower()
+        home = _u(System.getProperty("user.home"))
+        if "win" in osname:
+            pf = os.environ.get("ProgramFiles", r"C:\Program Files")
+            pfx = os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)")
+            lad = os.environ.get("LOCALAPPDATA", os.path.join(home, "AppData", "Local"))
+            cands = [
+                os.path.join(pf, "Google", "Chrome", "Application", "chrome.exe"),
+                os.path.join(pfx, "Google", "Chrome", "Application", "chrome.exe"),
+                os.path.join(lad, "Google", "Chrome", "Application", "chrome.exe"),
+                os.path.join(pfx, "Microsoft", "Edge", "Application", "msedge.exe"),
+                os.path.join(pf, "Microsoft", "Edge", "Application", "msedge.exe"),
+                os.path.join(pf, "Mozilla Firefox", "firefox.exe"),
+                os.path.join(pfx, "Mozilla Firefox", "firefox.exe"),
+            ]
+        elif "mac" in osname:
+            cands = [
+                "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+                "/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge",
+                "/Applications/Firefox.app/Contents/MacOS/firefox",
+            ]
+        else:
+            cands = ["/usr/bin/google-chrome", "/usr/bin/chromium",
+                     "/usr/bin/chromium-browser", "/usr/bin/microsoft-edge",
+                     "/usr/bin/firefox", "/snap/bin/chromium"]
+        for c in cands:
+            if os.path.isfile(c):
+                return c
+        return None
+
+    def _os_opener(self, url):
+        """Platform URL opener that takes the raw URL as an argument."""
+        osname = _u(System.getProperty("os.name")).lower()
+        if "mac" in osname:
+            return ["open", url]
+        if "win" in osname:
+            # rundll32 passes the URL to the default handler without a shell,
+            # so '&', '<', '>' in the URL are not interpreted (unlike cmd start).
+            return ["rundll32", "url.dll,FileProtocolHandler", url]
+        return ["xdg-open", url]
+
+    def _browse(self, url):
+        """Open a URL/file in a browser, passing it as a raw process argument so
+        a PoC URL with an unencoded payload in the fragment still opens."""
+        # 1) A real browser binary with the raw URL (most reliable for payloads).
+        exe = self._find_system_browser()
+        if exe:
+            try:
+                self._spawn([exe, "--new-window", url] if exe.lower().find("firefox") < 0
+                            else [exe, "-new-window", url])
+                return True
+            except Exception as e:
+                self._log("System browser launch failed (%s); trying OS opener." % e)
+        # 2) OS opener (raw argument, no shell).
+        try:
+            self._spawn(self._os_opener(url))
             return True
+        except Exception as e:
+            self._log("OS opener failed (%s); trying Desktop.browse." % e)
+        # 3) Last resort: Desktop.browse (may reject unencoded payload URLs).
+        try:
+            from java.awt import Desktop
+            from java.net import URI
+            if Desktop.isDesktopSupported() and Desktop.getDesktop().isSupported(Desktop.Action.BROWSE):
+                Desktop.getDesktop().browse(URI(url))
+                return True
+        except Exception as e:
+            self._log("Desktop.browse failed: %s" % e)
         return False
 
     def _burp_proxy_port(self):
@@ -2667,12 +2741,7 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener, IContextMenuFactory, IExt
                  "--no-default-browser-check", "--user-data-dir=" + udd,
                  "--new-window", url]
         try:
-            from java.lang import ProcessBuilder
-            from java.util import ArrayList
-            jargs = ArrayList()
-            for a in args:
-                jargs.add(a)
-            ProcessBuilder(jargs).start()
+            self._spawn(args)
             return True, "Launched Burp's embedded browser (proxy 127.0.0.1:%s)." % (port or "?")
         except Exception as e:
             return False, "Failed to launch Burp browser: %s" % e
